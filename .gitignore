@@ -1,0 +1,33 @@
+# Virtual environment
+venv/
+.venv/
+
+# API keys & secrets
+apikeys.md
+.env
+.env.*
+*.pem
+*.key
+
+# Logs (runtime data, not source)
+logs/
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
