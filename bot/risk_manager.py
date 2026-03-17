@@ -68,18 +68,28 @@ class RiskManager:
     def _redd_multiplier(self) -> float:
         """Rolling Economic Drawdown scaling.
 
-        Linearly reduces position sizes as drawdown increases.
-        At 0% dd → 1.0x, at max_dd_limit → 0.0x.
-        This smoothly protects Calmar instead of hard cutoffs.
+        Smoothly reduces NEW position sizes as drawdown increases.
+        At 0% dd → 1.0x, at 8% dd → 0.0x.
+        This is the PRIMARY drawdown control mechanism.
+        Circuit breakers below are EMERGENCY-only for tail events.
         """
         dd = self.drawdown_from_peak
-        max_dd_limit = 0.05  # at 5% drawdown, new positions are near zero
+        max_dd_limit = 0.10  # at 10% DD new positions = zero (matches level 3 breaker)
         if dd <= 0:
             return 1.0
-        scale = max(0.0, 1.0 - (dd / max_dd_limit))
-        return scale
+        return max(0.0, 1.0 - (dd / max_dd_limit))
 
     def check_drawdown_breakers(self) -> dict:
+        """Emergency breakers only. REDD handles normal drawdown smoothly.
+
+        Level 1: log warning only — REDD is already reducing sizing
+        Level 2: liquidate + short pause (actual emergency)
+        Level 3: liquidate + longer pause (catastrophic)
+
+        NO forced position reduction at level 1. Selling at the bottom
+        realizes losses and prevents recovery. REDD's smooth scaling
+        is strictly better than discrete cuts.
+        """
         dd = self.drawdown_from_peak
 
         if dd >= DRAWDOWN_LEVEL_3 and self.drawdown_level < 3:
@@ -96,8 +106,9 @@ class RiskManager:
 
         elif dd >= DRAWDOWN_LEVEL_1 and self.drawdown_level < 1:
             self.drawdown_level = 1
-            log.warning(f"DRAWDOWN LEVEL 1: {dd:.2%} — reducing positions 50%")
-            return {"level": 1, "action": "reduce", "reduce_pct": 0.5}
+            log.warning(f"DRAWDOWN LEVEL 1: {dd:.2%} — REDD active, new sizing at {self._redd_multiplier():.0%}")
+            # NO forced sell — REDD handles it. Just log the warning.
+            return {"level": 1, "action": "none", "reduce_pct": 0.0}
 
         if dd < DRAWDOWN_LEVEL_1 * 0.5:
             self.drawdown_level = 0
@@ -185,14 +196,20 @@ class RiskManager:
                 "entry_time": time.time(),
             }
 
-    def check_trailing_stop(self, pair: str, current_price: float) -> tuple[bool, str]:
-        """Check if trailing stop hit. Returns (should_exit, reason).
+    def check_trailing_stop(self, pair: str, current_price: float) -> tuple[bool, str, float]:
+        """Check if trailing stop hit.
 
-        Sortino-optimized: tight stops on downside, NO cap on upside for breakouts.
-        Mean-reversion gets profit target since it's a quick trade by design.
+        Returns (should_exit, reason, exit_fraction).
+        exit_fraction: 1.0 = full exit, 0.5 = partial exit (sell half).
+
+        Sortino-optimized:
+        - Tight stops on downside, NO upside cap on breakouts
+        - Breakouts: PARTIAL EXIT at +3% (sell 50%, lock in gains, let rest run)
+          This reduces downside vol in the Sortino denominator while preserving upside.
+        - Mean-reversion: full exit at profit target (quick trades by design)
         """
         if pair not in self.trailing_stops:
-            return False, ""
+            return False, "", 1.0
 
         info = self.trailing_stops[pair]
         high = info["high"]
@@ -200,56 +217,56 @@ class RiskManager:
         entry = info["entry_price"]
         entry_time = info.get("entry_time", time.time())
         holding_hours = (time.time() - entry_time) / 3600
+        partial_taken = info.get("partial_taken", False)
 
         drop_from_high = (high - current_price) / high if high > 0 else 0
         pnl_from_entry = (current_price - entry) / entry if entry > 0 else 0
 
-        # ── Mean reversion: tight stops + profit target ──
+        # ── Mean reversion: tight stops + profit target (full exits) ──
         if strategy == "mean_rev":
-            # Trailing: 2% from high
             if drop_from_high >= 0.02:
                 log.info(f"TRAILING STOP [mean_rev]: {pair} -{drop_from_high:.2%} from high")
-                return True, "trailing_stop"
-            # Hard stop: -3% from entry
+                return True, "trailing_stop", 1.0
             if pnl_from_entry <= -0.03:
                 log.info(f"HARD STOP [mean_rev]: {pair} {pnl_from_entry:.2%} from entry")
-                return True, "hard_stop"
-            # Profit target: +3% from entry
+                return True, "hard_stop", 1.0
             if pnl_from_entry >= 0.03:
                 log.info(f"PROFIT TARGET [mean_rev]: {pair} +{pnl_from_entry:.2%}")
-                return True, "profit_target"
-            # Time stop: if held >48h with no profit, exit (mean rev should be quick)
+                return True, "profit_target", 1.0
             if holding_hours > 48 and pnl_from_entry < 0.005:
-                log.info(f"TIME STOP [mean_rev]: {pair} held {holding_hours:.0f}h, pnl={pnl_from_entry:.2%}")
-                return True, "time_stop"
+                log.info(f"TIME STOP [mean_rev]: {pair} held {holding_hours:.0f}h")
+                return True, "time_stop", 1.0
 
-        # ── Breakout: wider stops, NO upside cap (Sortino optimization) ──
+        # ── Breakout: partial exit at +3%, trailing stop, NO upside cap ──
         else:
-            # Dynamic trailing: tighter when in profit, wider at entry
-            # In profit: trail at 3% from high
-            # Near entry: use hard stop only
-            if pnl_from_entry > 0.02:
-                # We're in profit — protect gains with trailing stop
-                trail_pct = 0.03
+            # Hard stop near entry
+            if pnl_from_entry <= -0.04:
+                log.info(f"HARD STOP [breakout]: {pair} {pnl_from_entry:.2%} from entry")
+                return True, "hard_stop", 1.0
+
+            # PARTIAL EXIT: sell 50% at +3% to lock in gains (Sortino optimization)
+            # The locked-in profit reduces variance of outcomes
+            # The remaining 50% rides with no upside cap
+            if pnl_from_entry >= 0.03 and not partial_taken:
+                log.info(f"PARTIAL EXIT [breakout]: {pair} +{pnl_from_entry:.2%}, selling 50%")
+                info["partial_taken"] = True
+                # After partial, widen the trailing stop for the remaining position
+                info["entry_price"] = entry  # keep original entry for PnL tracking
+                return True, "partial_exit", 0.5
+
+            # Trailing stop (only after partial or in profit zone)
+            if partial_taken or pnl_from_entry > 0.02:
+                trail_pct = 0.04 if partial_taken else 0.03  # wider after partial
                 if drop_from_high >= trail_pct:
-                    log.info(f"TRAILING STOP [breakout]: {pair} -{drop_from_high:.2%} from high (profit zone)")
-                    return True, "trailing_stop"
-            else:
-                # Still near entry — only hard stop
-                if pnl_from_entry <= -0.04:
-                    log.info(f"HARD STOP [breakout]: {pair} {pnl_from_entry:.2%} from entry")
-                    return True, "hard_stop"
+                    log.info(f"TRAILING STOP [breakout]: {pair} -{drop_from_high:.2%} from high")
+                    return True, "trailing_stop", 1.0
 
-            # NO profit target on breakouts — let winners run
-            # This is the key Sortino optimization:
-            # Sortino only penalizes downside vol, upside vol is free
-
-            # Time stop: if held >72h with no meaningful profit, exit
+            # Time stop
             if holding_hours > 72 and pnl_from_entry < 0.01:
-                log.info(f"TIME STOP [breakout]: {pair} held {holding_hours:.0f}h, pnl={pnl_from_entry:.2%}")
-                return True, "time_stop"
+                log.info(f"TIME STOP [breakout]: {pair} held {holding_hours:.0f}h")
+                return True, "time_stop", 1.0
 
-        return False, ""
+        return False, "", 1.0
 
     def clear_trailing_stop(self, pair: str) -> Optional[dict]:
         """Remove trailing stop, return the stop info (for ML training)."""

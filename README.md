@@ -1,182 +1,147 @@
 # Quant Trading Bot — Roostoo Hackathon 2026
 
-Autonomous crypto trading bot for the SG vs HK Web3 Quant Hackathon. Multi-layer signal stack combining technical analysis, derivatives market intelligence, HMM regime detection, sentiment analysis, and ML confidence gating. Optimized for the competition's risk-adjusted scoring formula (0.4×Sortino + 0.3×Sharpe + 0.3×Calmar).
+Autonomous crypto trading bot for the SG vs HK Web3 Quant Hackathon. Multi-layer signal stack with derivatives market intelligence, HMM regime detection, and Sortino-optimized risk management. Backtested on 6 months of data across 24 coins.
 
-## Architecture Overview
+## Strategy Overview
 
+### The Core Problem
+
+Competition scoring: **60% code & strategy review, 40% risk-adjusted returns** (0.4×Sortino + 0.3×Sharpe + 0.3×Calmar). This means clean architecture and documented reasoning matter more than raw returns — but you still need top-20 returns to qualify.
+
+### What We Tested (and What Failed)
+
+**Signal backtests across 24 coins, 42 days of hourly data:**
+
+| Strategy | Avg PnL | Win Rate | Avg MaxDD | Verdict |
+|---|---|---|---|---|
+| EMA Crossover 12/26 | +3.4% | 32% | 12.6% | OK on trending coins only |
+| 3-Day Momentum | -10.2% | 24% | 19.5% | Lost money on most coins |
+| RSI Mean Reversion | -3.3% | 47% | 10.0% | High win rate, consistent |
+| 72h Breakout | +0.5% | 37% | 8.3% | Best risk-adjusted |
+| Volume + Momentum | -7.5% | 28% | 17.6% | No edge over plain momentum |
+
+**Key finding:** Pure momentum has ~0% autocorrelation at 24h horizons. The market is mean-reverting short-term with occasional breakout trends.
+
+**ML experiment:** We built a full LightGBM pipeline (31K samples, 6 months, purged walk-forward CV, ensemble of 3 models). AUC was 0.55 on temporally-honest evaluation — no better than random. Price-derived features and even positioning data (funding rates, OI, long/short ratios) don't predict 6-hour forward returns from public data. We disabled the ML gate and focused on what works: rule-based signals with robust risk management.
+
+### What We Built: v3 Signal Stack
+
+#### Engine 1 — Breakout Detection (volume-confirmed)
+- Entry: Price exceeds 72-hour high AND volume > 1.3× average AND EMA(21) > EMA(55)
+- Volume confirmation is **mandatory** (v3 change — eliminates fake breakouts on thin volume)
+- No upside cap (Sortino optimization: upside volatility is free)
+- Partial exit: sell 50% at +3% to lock in gains, let rest run with wider 4% trailing stop
+- Hard stop: -4% from entry
+
+#### Engine 2 — RSI Mean Reversion
+- Entry: RSI(14) < 25 (tightened from 30 in v3 — fewer, higher-conviction entries)
+- Profit target: +3% from entry
+- Trailing stop: 2% from high, hard stop: -3%
+- Time stop: 48h with no profit
+
+#### Engine 3 — OI-Price Divergence (derivatives-driven)
+- Entry: Price falling but open interest rising → shorts piling in → squeeze potential
+- Only fires when RSI < 40 (oversold confirmation)
+- Contrarian signal backed by academic research
+
+### Signal Filters & Overlays
+
+| Layer | Effect |
+|---|---|
+| **Derivatives overlay** | Funding z-score > 1.5 → block buy (market over-long). < -1.0 → boost strength +15% |
+| **BTC crash filter** | BTC down >1.5% in last hour → skip all altcoin buys for 15 min |
+| **BTC momentum boost** | BTC breaking out with acceleration → boost altcoin breakout strength |
+| **Regime detection** | HMM on BTC → modulates exposure budget (not signal suppression) |
+| **Fear & Greed** | Extreme readings → scale max exposure ±15% |
+
+### Risk Management
+
+**Position Sizing — Volatility-Parity × REDD:**
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           MAIN LOOP (5 min)                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ┌─────────────┐ ┌──────────────┐ ┌─────────────┐ ┌────────────────┐  │
-│  │  BINANCE     │ │  DERIVATIVES │ │  SENTIMENT  │ │    ROOSTOO     │  │
-│  │  Spot OHLCV  │ │  Funding     │ │  Fear/Greed │ │    Ticker      │  │
-│  │  43 pairs    │ │  Open Int.   │ │  BTC Lead   │ │    Balance     │  │
-│  └──────┬───────┘ └──────┬───────┘ └──────┬──────┘ └───────┬────────┘  │
-│         │                │                │                 │           │
-│         ▼                ▼                ▼                 │           │
-│  ┌──────────────────────────────────────────────┐          │           │
-│  │         REGIME DETECTOR (HMM on BTC)         │          │           │
-│  │  TRENDING → breakout priority, full exposure  │          │           │
-│  │  VOLATILE → mean-rev priority, cut exposure   │          │           │
-│  └──────────────────┬───────────────────────────┘          │           │
-│                     │                                       │           │
-│                     ▼                                       │           │
-│  ┌─────────────────────────────────────────────────────────┐│           │
-│  │              SIGNAL ENGINE (per coin)                    ││           │
-│  │  Engine 1: Breakout (72h high + EMA + volume)           ││           │
-│  │  Engine 2: RSI Mean Reversion (oversold dips)           ││           │
-│  │  Engine 3: OI-Price Divergence (derivatives contrarian)  ││           │
-│  │  + regime filter + BTC crash filter + deriv overlay      ││           │
-│  └──────────────────┬──────────────────────────────────────┘│           │
-│                     │                                       │           │
-│                     ▼                                       │           │
-│  ┌────────────────────────────────────┐                    │           │
-│  │   ML CONFIDENCE GATE (LightGBM)   │                    │           │
-│  │   Pass only if P(profit) > 55%    │                    │           │
-│  │   Trains online from trade results │                    │           │
-│  └──────────────────┬─────────────────┘                    │           │
-│                     │                                       │           │
-│                     ▼                                       ▼           │
-│  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │              RISK MANAGER                                        │  │
-│  │  Volatility-parity sizing × REDD scaling × regime × sentiment   │  │
-│  │  Strategy-specific stops: breakout (3% trail, no upside cap)    │  │
-│  │                           mean-rev (2% trail, 3% profit target) │  │
-│  │  Drawdown breakers: -2% reduce, -4% liquidate, -7% emergency   │  │
-│  └──────────────────┬───────────────────────────────────────────────┘  │
-│                     │                                                  │
-│                     ▼                                                  │
-│  ┌──────────────────────────────────┐                                 │
-│  │   EXECUTOR → Roostoo API        │                                 │
-│  │   Limit orders → market fallback │                                 │
-│  └──────────────────────────────────┘                                 │
-└─────────────────────────────────────────────────────────────────────────┘
+base_size = (2.5% × portfolio) / daily_vol
+effective_size = base_size × REDD_mult × regime_mult × signal_strength
 ```
+REDD (Rolling Economic Drawdown) smoothly reduces new position sizes as drawdown grows. At 0% DD → full size. At 10% DD → zero new positions. No forced selling at intermediate levels — discrete circuit breakers are emergency-only.
 
-## Strategy Deep Dive
+**Sortino-Optimized Exits:**
+- Breakout: tight downside stop (-4%), NO upside cap. Partial exit at +3% locks in half.
+- Mean-rev: symmetric stops (±3%), quick profit-taking.
+- The partial exit at +3% reduces realized downside variance (Sortino denominator) while preserving unlimited upside. This is the key scoring-function optimization.
 
-### Layer 1: Data Advantage
+**Drawdown Circuit Breakers (emergency-only):**
 
-Most teams will use only the Roostoo ticker API (price, bid, ask, change). We pull from **4 data sources**:
+| Level | Threshold | Action |
+|---|---|---|
+| 1 | -3.5% | Warning log. REDD already reducing sizing. No forced sells. |
+| 2 | -6% | Liquidate all, pause 4h |
+| 3 | -10% | Liquidate all, pause 12h |
+
+Widened from original -2%/-4%/-7% after backtests showed the tight levels were selling bottoms and preventing recovery. BTC routinely moves 3-5% in a day — -2% trigger was firing on normal volatility.
+
+**Commission Optimization:**
+- Entries: limit orders (0.05% maker fee)
+- Non-urgent exits (trailing stops, profit targets): limit orders (0.05%)
+- Urgent exits (hard stops, breakdowns): market orders (0.10%)
+- Saves ~0.05% per non-urgent trade. Over hundreds of trades, this is real money.
+
+### Data Sources
 
 | Source | Data | Update Freq | Purpose |
 |---|---|---|---|
 | Binance Spot | OHLCV candles, 43 pairs | Every 5 min | Technical indicators, breakout detection |
 | Binance Futures | Funding rates, open interest | Every 30 min | Derivatives sentiment, squeeze detection |
-| Alternative.me | Fear & Greed Index | Hourly | Market-wide sentiment regime |
+| Alternative.me | Fear & Greed Index | Hourly | Market-wide sentiment |
 | Roostoo | Live prices, wallet, orders | Every 5 min | Execution |
-
-### Layer 2: Regime Detection (HMM)
-
-A 2-state Gaussian Hidden Markov Model fitted on BTC returns + rolling volatility identifies the current market regime:
-
-- **TRENDING (low vol)**: Prioritize breakout signals, full exposure budget
-- **VOLATILE (high vol)**: Prioritize mean-reversion, halve exposure, suppress breakout entries
-
-This prevents the biggest source of losses: running a trending strategy in a choppy market (or vice versa). Research shows HMMs increase Sharpe by filtering out wrong-regime trades.
-
-The HMM fits on startup using ~1000 5-min BTC candles and re-predicts every cycle (lightweight). Full refit every 24 hours.
-
-### Layer 3: Signal Generation (3 engines)
-
-**Engine 1 — Breakout Detection**
-- Entry: Price exceeds 72-hour high, EMA(21) > EMA(55), trend aligned
-- Volume confirmation boosts signal strength by +0.2
-- Suppressed in VOLATILE regime (HMM) and during BTC crashes
-- Backtest: +27-43% on trending coins (FET, ZEC, NEAR), maxDD ~4%
-
-**Engine 2 — RSI Mean Reversion**
-- Entry: RSI(14) drops below 30 (oversold)
-- Preferred strategy in VOLATILE regime
-- Backtest: 78% win rate on XRP, 53-61% on stable coins
-
-**Engine 3 — OI-Price Divergence (derivatives-driven)**
-- Entry: Price falling but open interest rising → shorts piling in → squeeze potential
-- Strongest contrarian signal from academic research
-- Only fires when RSI < 40 (confirmation of oversold condition)
-
-### Layer 4: Derivatives Overlay
-
-Funding rates and open interest are overlaid on all signals:
-
-| Derivatives Condition | Effect |
-|---|---|
-| Funding z-score > 1.5 (market over-long) | Suppress buy signals |
-| Funding z-score < -1.5 (market over-short) | Boost buy strength |
-| OI rising + price falling (divergence) | Trigger contrarian buy |
-| Strong bearish composite (< -0.5) | Block all new entries |
-| Bullish composite (> 0.3) | Boost signal strength +15% |
-
-### Layer 5: ML Confidence Gate
-
-A LightGBM binary classifier acts as a meta-model:
-- 16 features: RSI, EMA distances, ATR ratio, volume ratio, multi-timeframe returns, realized vol, downside vol, funding z-score, OI change, BTC return, regime state, breakout strength, spread
-- Trained online from actual trade outcomes
-- Only passes entries where P(profitable) > 55%
-- Starts as pass-through (untrained), becomes active after ~200 trades
-- Retrains every 24 hours
-
-This is not meant to generate signals — it **filters false signals** from the rule-based engines. Research shows this ensemble approach (rules + ML gate) reduces false entries by ~40%.
-
-### Layer 6: Risk Management (Sortino-Optimized)
-
-**Sortino Optimization Insight**: Sortino ratio (40% of score) only penalizes *downside* volatility. Upside volatility is free. This means:
-- Breakout stops: tight on downside (-4% hard stop), **no upside cap** — let winners run
-- Mean-rev stops: tight both ways (2% trail, 3% profit target, -3% hard stop)
-- Time stops: exit stale positions (48h for mean-rev, 72h for breakout)
-
-**REDD (Rolling Economic Drawdown) Scaling**:
-Instead of hard drawdown cutoffs, position sizes scale linearly down as drawdown grows:
-```
-size_multiplier = max(0, 1 - drawdown / 0.05)
-```
-At 0% drawdown → full size. At 2.5% → half size. At 5% → zero new positions. This smoothly protects Calmar.
-
-**Exposure Stack**: Multiple independent multipliers compound:
-```
-effective_max_exposure = base (60%) × regime_mult × sentiment_mult × REDD_mult
-```
-In the worst case (volatile regime + extreme greed + 3% drawdown), effective exposure drops to ~5%.
-
-**Hard Circuit Breakers**: -2% reduce 50%, -4% liquidate + pause 12h, -7% emergency 48h pause.
 
 ## Backtest Results
 
-### Full Period (37 days, 24 coins)
+### 6-Month Backtest (175 days, 24 coins, 4320 hourly bars each)
 
 | Metric | Value |
 |---|---|
-| Total Return | +5.12% |
-| Max Drawdown | 4.72% |
-| Sharpe Ratio | 2.51 |
-| Sortino Ratio | 8.87 |
-| Calmar Ratio | 10.71 |
-| **Composite Score** | **7.52** |
-| Trades | 718 |
+| Total Return | +0.97% |
+| Max Drawdown | 8.67% |
+| Trades | 2,449 |
+| Win Rate | 25% |
 
-### Rolling 10-Day Windows (Competition Format)
+### Rolling 10-Day Windows (56 windows over 6 months)
 
 | Metric | Value |
 |---|---|
-| Positive Windows | **7/10 (70%)** |
-| Avg Return | +1.04% |
-| Worst Return | -2.47% |
-| Avg Max Drawdown | 3.40% |
-| Worst Max Drawdown | 4.78% |
-| Avg Composite | 6.44 |
+| Positive Windows | **26/56 (46%)** |
+| Avg Return | +0.43% |
+| Best Window | **+11.28%** |
+| Worst Window | -6.25% |
+| Avg Max Drawdown | 3.38% |
+| Avg Composite | 8.94 |
 
-### Trade Analysis
+The strategy captures large trends when they occur (+9-11% in favorable windows) and limits damage in adverse conditions. The 46% positive rate reflects that crypto spent extended periods in bearish trends during this 6-month sample — a long-only strategy cannot profit during sustained selloffs.
 
-| Exit Reason | Count | Avg PnL |
-|---|---|---|
-| Profit target (mean-rev) | 55 | +3.67% |
-| Signal-based exit | 166 | +0.62% |
-| Trailing stop | 131 | -1.49% |
-| Hard stop | — | -3.2% |
+### Trade Analysis (6-month)
 
-Average winner (+3.67%) is much larger than average loser (-1.49%) — positive expectancy despite 20% win rate.
+| Exit Reason | Count | Avg PnL | Purpose |
+|---|---|---|---|
+| Signal sell | 622 | +0.86% | Trend reversal / RSI overbought |
+| Partial exit | 143 | +4.33% | Lock in 50% at +3% (Sortino opt) |
+| Profit target | 141 | +3.84% | Mean-rev +3% target |
+| Trailing stop | 272 | -1.13% | Protect gains / limit losses |
+| Hard stop | 91 | -4.61% | Maximum loss per trade |
+
+Average winner (+4.33%) significantly exceeds average loser (-1.13%). The strategy is profitable despite 25% win rate because winners are 3-4× larger than losers.
+
+### What the ML Experiment Taught Us
+
+We built and rigorously tested an ML confidence gate:
+- **Data:** 31,533 samples from 6 months × 24 coins
+- **Model:** LightGBM ensemble (3 models: conservative, balanced, expressive)
+- **Validation:** Purged walk-forward CV with 120-bar gap (no data leakage)
+- **Result:** AUC 0.55 — no better than random
+
+We then tried positioning-only features (funding rates, OI, long/short ratios, taker buy/sell, top trader positions) — same result: AUC 0.555.
+
+**Conclusion:** Public data — whether price-derived or positioning-derived — doesn't predict 6-hour forward returns in a temporally honest evaluation. The signal is arbitraged away within minutes by HFT firms. We disabled the ML gate rather than deploy a model that would randomly block profitable signals.
+
+This is documented in the `ml-gating-explore` branch with full code, training scripts, and results.
 
 ## Project Structure
 
@@ -188,29 +153,38 @@ quant-competition/
 ├── requirements.txt                # Dependencies
 │
 ├── bot/
-│   ├── config.py                   # All tunable parameters
+│   ├── config.py                   # All parameters (v3 competition-tuned)
 │   ├── roostoo_client.py           # Roostoo API with HMAC signing
 │   ├── binance_data.py             # Binance spot candle feed
 │   ├── derivatives_data.py         # Binance futures: funding rates + OI
 │   ├── regime_detector.py          # HMM regime detection on BTC
 │   ├── sentiment.py                # Fear & Greed + BTC lead-lag filter
-│   ├── ml_model.py                 # LightGBM confidence gate
-│   ├── signals.py                  # Dual-engine signal generation
-│   ├── risk_manager.py             # REDD sizing + Sortino-optimized stops
-│   ├── executor.py                 # Order placement & management
+│   ├── ml_model.py                 # ML confidence gate (disabled — see writeup)
+│   ├── signals.py                  # v3: volume-required breakouts + RSI 25
+│   ├── risk_manager.py             # REDD sizing + partial exits + Sortino stops
+│   ├── executor.py                 # Limit/market order management
 │   ├── metrics.py                  # Live Sharpe/Sortino/Calmar tracking
 │   ├── logger.py                   # Structured JSON logging
-│   └── main.py                     # Main loop orchestrator
+│   ├── main.py                     # v3 main loop orchestrator
+│   └── models/                     # ML model artifacts (gitignored)
+│       ├── ml_model.txt            # Primary LightGBM model
+│       ├── ml_model_ens[0-2].txt   # Ensemble models
+│       └── ml_model_meta.json      # Training metadata
 │
 ├── bot/backtest/
 │   ├── data_loader.py              # Shared data utilities
+│   ├── bt_integrated.py            # Full integrated backtest (6 months)
 │   ├── bt_market_analysis.py       # Market structure analysis
-│   ├── bt_signal_comparison.py     # Compare 5 signal types per coin
-│   ├── bt_full_portfolio.py        # Full portfolio sim (8/10-day windows)
-│   ├── bt_param_sensitivity.py     # Parameter sweep analysis
+│   ├── bt_signal_comparison.py     # Compare signal types per coin
+│   ├── bt_full_portfolio.py        # Legacy portfolio sim
+│   ├── bt_param_sensitivity.py     # Parameter sweeps
+│   ├── pretrain_ml.py              # ML training pipeline (disabled)
 │   └── run_all.py                  # Run all backtests
 │
 └── logs/                           # Runtime logs (gitignored)
+    ├── bot.jsonl                   # General bot logs
+    ├── trades.jsonl                # Trade journal
+    └── cycles.jsonl                # Per-cycle state snapshots
 ```
 
 ## Setup & Running
@@ -220,51 +194,34 @@ quant-competition/
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
 
-# Configure
+# Configure API keys
 cp .env.example .env
-# Edit .env with your Roostoo API credentials
+# Edit .env with your Roostoo credentials
 
 # Run the bot
 venv/bin/python run.py
 
 # Run backtests
-venv/bin/python -m bot.backtest.run_all
-venv/bin/python -m bot.backtest.bt_full_portfolio    # portfolio sim with 8/10-day windows
-venv/bin/python -m bot.backtest.bt_param_sensitivity  # parameter sweeps
+venv/bin/python -m bot.backtest.bt_integrated      # full 6-month integrated test
+venv/bin/python -m bot.backtest.bt_signal_comparison # signal type comparison
+venv/bin/python -m bot.backtest.bt_market_analysis   # current market structure
 ```
 
-## How to Verify
+## Version History
 
-1. **Run `bt_signal_comparison`** — confirms breakout + RSI are the strongest signal types
-2. **Run `bt_full_portfolio`** — shows rolling 8-day and 10-day window performance
-3. **Run `bt_param_sensitivity`** — shows strategy is robust across parameter ranges (not overfit)
-4. **Check `logs/cycles.jsonl`** — every cycle logs regime state, derivatives data, signals, and risk status
-5. **Check `logs/trades.jsonl`** — every trade logged with entry reason, exit reason, and P&L
-
-## What to Improve
-
-**Quick wins:**
-- Per-coin RSI thresholds (RSI 25 works better for XRP, RSI 35 for DOGE)
-- Adaptive breakout lookback based on ATR (wider in low-vol, tighter in high-vol)
-- Correlation filter to avoid holding 5 correlated altcoins
-
-**Medium effort:**
-- Cointegration-based pairs trading (third signal engine)
-- HRP (Hierarchical Risk Parity) portfolio allocation via `skfolio`
-- Pre-train ML model on 6 months of historical data before competition starts
-
-**Research:**
-- Liquidation heatmap positioning (CoinGlass data)
-- On-chain whale flow signals (CryptoQuant free tier)
-- Order book imbalance from Binance WebSocket depth stream
+| Version | Changes | Backtest Impact |
+|---|---|---|
+| v1 | Breakout + RSI, basic vol-parity, 60% exposure, 3% trailing stop | +5.1% / 37d, composite 7.5 |
+| v2 | + HMM regime suppression, ML gate, REDD, derivatives | -2.1% / 37d — regime suppression killed returns |
+| v3 | Remove regime suppression, disable ML, require volume on breakout, RSI→25, 80% exposure, partial exits, limit orders | +1.3% / 37d, composite 2.3. Over 6mo: +0.97%, avg 10d composite 8.94 |
 
 ## Competition Scoring Reference
 
 | Screen | Weight | Our Approach |
 |---|---|---|
 | Rule Compliance | Pass/fail | Full logging, autonomous execution, clean commit history |
-| Portfolio Returns | Top 20 qualify | Multi-engine signals capture trends + dips |
-| Risk-Adjusted Score | 40% | Sortino-optimized stops, REDD sizing, regime gating, drawdown breakers |
-| Code & Strategy Review | 60% | Modular architecture, 12 specialized modules, documented rationale |
+| Portfolio Returns | Top 20 qualify | Competition-tuned exposure (80%), volume-confirmed entries |
+| Risk-Adjusted Score | 40% | Sortino-optimized exits, REDD sizing, partial exits, drawdown breakers |
+| Code & Strategy Review | 60% | 12 specialized modules, documented ML experiment, honest backtest results |
 
 **Composite: 0.4 × Sortino + 0.3 × Sharpe + 0.3 × Calmar**

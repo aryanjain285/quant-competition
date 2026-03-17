@@ -18,7 +18,6 @@ if os.path.exists(_env_path):
                 os.environ.setdefault(key.strip(), value.strip())
 
 # --- API Configuration ---
-# Set these via .env file or environment variables before running the bot.
 API_KEY = os.getenv("ROOSTOO_API_KEY", "")
 API_SECRET = os.getenv("ROOSTOO_API_SECRET", "")
 BASE_URL = os.getenv("ROOSTOO_BASE_URL", "https://mock-api.roostoo.com")
@@ -29,7 +28,7 @@ BINANCE_FUTURES_URL = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com
 
 # --- Timing ---
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL", "300"))  # 5 minutes
-LIMIT_ORDER_TIMEOUT_SECONDS = 90  # cancel unfilled limits after this
+LIMIT_ORDER_TIMEOUT_SECONDS = 90
 
 # --- Signal Parameters ---
 EMA_FAST = 21
@@ -47,49 +46,49 @@ MOMENTUM_WEIGHTS = {
     "3d": 0.25,
 }
 
-# --- Signal Parameters (v2: dual engine) ---
-# Breakout: 72h lookback on 5-min candles = 864 periods
-# Using hourly-equivalent: 72 periods on 5-min data ≈ 6h breakout window
-# But we also load 1h data separately, so actual lookback is configurable
+# --- Signal Parameters (v3) ---
 BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "864"))  # 72h in 5-min bars
 
-# RSI mean reversion
-RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "30"))
+# RSI mean reversion (tightened in v3)
+RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "25"))      # was 30 — fewer, better entries
 RSI_OVERBOUGHT = float(os.getenv("RSI_OVERBOUGHT", "65"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 
 # --- Risk Management ---
-MAX_POSITION_PCT = 0.20          # max 20% of portfolio in one coin
-MAX_TOTAL_EXPOSURE_PCT = 0.60    # max 60% invested, 40% cash
-TARGET_RISK_PER_TRADE = 0.015    # risk 1.5% of portfolio per position
-MAX_POSITIONS = 8                # hold at most 8 coins at once
+# v3 COMPETITION TUNING: this is a mock portfolio with zero real downside.
+# Institutional-level conservatism (v1: 60% max, 8 pos, 1.5% risk) left
+# too much capital idle. Competition rewards being in the market.
+MAX_POSITION_PCT = 0.15          # 15% per coin (was 20% — more positions, less concentration)
+MAX_TOTAL_EXPOSURE_PCT = 0.80    # 80% invested (was 60% — deploy more capital)
+TARGET_RISK_PER_TRADE = 0.025    # 2.5% risk per trade (was 1.5% — bigger bets)
+MAX_POSITIONS = 12               # 12 positions (was 8 — more diversification)
 
-# Trailing stop: adaptive based on ATR, fallback to fixed %
-TRAILING_STOP_PCT = 0.03         # -3% trailing stop per position (wider to avoid whipsaw)
-TRAILING_STOP_ATR_MULT = 2.0     # alternative: 2x ATR trailing stop
+# Trailing stop
+TRAILING_STOP_PCT = 0.03
+TRAILING_STOP_ATR_MULT = 2.0
 
-# Drawdown circuit breakers (from portfolio peak)
-DRAWDOWN_LEVEL_1 = 0.02   # -2%: cut positions 50%
-DRAWDOWN_LEVEL_2 = 0.04   # -4%: liquidate all, pause 12h
-DRAWDOWN_LEVEL_3 = 0.07   # -7%: cash only for 48h
+# Drawdown circuit breakers (WIDENED for crypto volatility)
+# REDD handles smooth scaling; these are emergency-only.
+# v3: widened from 2%/4%/7% to avoid premature liquidation
+DRAWDOWN_LEVEL_1 = 0.035  # -3.5%: warning only (REDD already reducing sizing)
+DRAWDOWN_LEVEL_2 = 0.06   # -6%: liquidate + 4h pause (was 12h)
+DRAWDOWN_LEVEL_3 = 0.10   # -10%: liquidate + 12h pause (was 48h)
 
 DRAWDOWN_PAUSE_HOURS = {
-    1: 0,     # level 1: no pause, just reduce
-    2: 12,    # level 2: pause 12 hours
-    3: 48,    # level 3: pause 48 hours
+    1: 0,     # level 1: no pause, REDD handles it
+    2: 4,     # level 2: 4h pause (was 12h — too long, misses recovery)
+    3: 12,    # level 3: 12h pause (was 48h — risked failing 8-day activity rule)
 }
 
 # --- Volatility ---
-VOL_LOOKBACK_PERIODS = 288  # 24h of 5-min candles for realized vol
-VOL_REGIME_BASELINE_PERIODS = 8640  # 30 days of 5-min candles
+VOL_LOOKBACK_PERIODS = 288
+VOL_REGIME_BASELINE_PERIODS = 8640
 
 # --- Execution ---
 USE_LIMIT_ORDERS = True
-LIMIT_ORDER_OFFSET_BPS = 1  # place limit 1 bps inside spread
+LIMIT_ORDER_OFFSET_BPS = 1
 
 # --- Coin Filtering ---
-# Focus on liquid, well-known coins with Binance data available.
-# Exclude obscure tokens where Binance data won't match.
 TRADEABLE_COINS = [
     "BTC/USD", "ETH/USD", "SOL/USD", "BNB/USD", "XRP/USD",
     "DOGE/USD", "ADA/USD", "AVAX/USD", "LINK/USD", "DOT/USD",

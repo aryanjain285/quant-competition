@@ -1,16 +1,21 @@
 """
-Main trading bot loop v2.
-Orchestrates: data → regime → signals → derivatives → ML gate → risk → execution → logging.
+Main trading bot loop v3.
+Orchestrates: data → signals → derivatives → risk → execution → logging.
+
+Changes from v2:
+  - ML gate DISABLED (no alpha in temporally-honest CV)
+  - Regime breakout suppression REMOVED (was net negative in backtest)
+  - Non-urgent exits use LIMIT orders (0.05% vs 0.1% taker)
+  - Regime still used for exposure sizing (multiplicative, not binary)
 
 Architecture:
   1. Poll data (Roostoo ticker + Binance candles + derivatives + sentiment)
-  2. Detect market regime (HMM on BTC)
+  2. Detect market regime (HMM on BTC) → exposure modulation only
   3. Compute per-coin signals (breakout + mean reversion)
   4. Overlay derivatives signals (funding + OI)
-  5. ML confidence gate (approve/reject entries)
-  6. Risk management (REDD sizing, trailing stops, drawdown breakers)
-  7. Execute orders
-  8. Log everything + feed results back to ML
+  5. Risk management (REDD sizing, trailing stops, partial exits)
+  6. Execute orders (limit for entries + non-urgent exits, market for stops)
+  7. Log everything
 """
 import os
 import time
@@ -29,7 +34,6 @@ from bot.binance_data import BinanceData
 from bot.derivatives_data import DerivativesData
 from bot.regime_detector import RegimeDetector
 from bot.sentiment import SentimentAnalyzer
-from bot.ml_model import MLConfidenceGate
 from bot.signals import compute_signal
 from bot.risk_manager import RiskManager
 from bot.executor import Executor
@@ -52,11 +56,11 @@ signal.signal(signal.SIGTERM, _shutdown)
 
 
 class TradingBot:
-    """Main trading bot orchestrator with full signal stack."""
+    """Main trading bot orchestrator."""
 
     def __init__(self):
         log.info("=" * 60)
-        log.info("INITIALIZING TRADING BOT v2")
+        log.info("INITIALIZING TRADING BOT v3")
         log.info("=" * 60)
 
         # ── Core infrastructure ──
@@ -78,7 +82,6 @@ class TradingBot:
         self.active_pairs = [p for p in TRADEABLE_COINS if p in self.trade_pairs]
         log.info(f"Active pairs: {len(self.active_pairs)}")
 
-        # Get initial balance
         wallet = self.client.balance()
         if wallet is None:
             log.error("Cannot fetch balance!")
@@ -95,9 +98,7 @@ class TradingBot:
         # ── Intelligence layers ──
         self.regime = RegimeDetector()
         self.sentiment = SentimentAnalyzer()
-        # Load pre-trained ML model if available
-        ml_model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bot", "ml_model.txt")
-        self.ml_gate = MLConfidenceGate(model_path=ml_model_path)
+        # ML gate NOT loaded — no model files deployed
 
         # ── Risk & execution ──
         self.risk_mgr = RiskManager(initial_value)
@@ -107,12 +108,10 @@ class TradingBot:
         # ── State ──
         self.positions: dict[str, float] = {}
         self._sync_positions_from_wallet(wallet)
-        # Track entry features for ML feedback: pair -> features array
-        self.entry_features: dict[str, np.ndarray] = {}
 
         self.cycle_count = 0
-        self.deriv_update_interval = 6  # update derivatives every 6 cycles (30 min)
-        self.regime_refit_interval = 288  # refit HMM every ~24h
+        self.deriv_update_interval = 6
+        self.regime_refit_interval = 288
 
     # ─── Helpers ────────────────────────────────────────────────
 
@@ -149,24 +148,17 @@ class TradingBot:
     # ─── Startup ────────────────────────────────────────────────
 
     def load_historical_data(self):
-        """Load all historical data on startup."""
         log.info("Loading historical data...")
-
-        # Binance spot candles
         self.binance.load_history(self.active_pairs, interval="5m", limit=1000)
 
-        # Derivatives data (funding rates + OI)
         log.info("Loading derivatives data...")
         self.derivatives.load_all(self.active_pairs)
 
-        # Fit regime detector on BTC
         btc_closes = self.binance.get_closes("BTC/USD")
         if len(btc_closes) > 100:
             self.regime.fit(btc_closes)
 
-        # Fetch sentiment
         self.sentiment.update_fear_greed()
-
         log.info("All historical data loaded.")
 
     # ─── Main Cycle ─────────────────────────────────────────────
@@ -207,22 +199,20 @@ class TradingBot:
             return
 
         # ── 3. Update intelligence layers ──
-        # Regime (every cycle — lightweight predict, heavy refit periodically)
         btc_closes = self.binance.get_closes("BTC/USD")
         self.regime.update(btc_closes)
         if self.cycle_count % self.regime_refit_interval == 0:
             self.regime.fit(btc_closes)
 
+        # Regime used ONLY for exposure sizing, NOT for suppressing signals
         self.risk_mgr.set_regime_multiplier(self.regime.get_exposure_multiplier())
 
-        # Derivatives (every N cycles — API rate limits)
         if self.cycle_count % self.deriv_update_interval == 0:
             self.derivatives.load_all(self.active_pairs)
 
         spot_prices = {p: t.get("LastPrice", 0) for p, t in ticker_data.items()}
         deriv_signals = self.derivatives.compute_signals(self.active_pairs, spot_prices)
 
-        # Sentiment (once per hour)
         if self.cycle_count % 12 == 1:
             self.sentiment.update_fear_greed()
         self.sentiment.update_btc_context(btc_closes.tolist() if len(btc_closes) > 0 else [])
@@ -252,36 +242,31 @@ class TradingBot:
             dsig = deriv_signals.get(pair, {})
             deriv_score = dsig.get("composite_deriv_score", 0)
 
-            # Derivatives can boost or suppress signals
             if sig["action"] == "BUY":
+                # Derivatives suppression (only for extreme readings)
                 if deriv_score < -0.5:
-                    # Strong bearish derivatives → suppress buy
                     sig["action"] = "HOLD"
                     sig["strategy"] = "deriv_suppress"
                 elif deriv_score > 0.3:
-                    # Bullish derivatives → boost strength
                     sig["strength"] = min(1.0, sig["strength"] + 0.15)
 
-                # OI-price divergence = strong contrarian buy
+                # OI-price divergence contrarian buy
                 if dsig.get("oi_price_divergence") and dsig.get("oi_signal", 0) > 0:
                     if sig["action"] == "HOLD" and sig.get("rsi", 50) < 40:
                         sig["action"] = "BUY"
                         sig["strategy"] = "oi_divergence"
                         sig["strength"] = 0.7
 
-            # ── Regime filter ──
-            if sig["action"] == "BUY" and sig["strategy"] == "breakout":
-                if self.regime.should_skip_breakout():
-                    sig["action"] = "HOLD"
-                    sig["strategy"] = "regime_suppress"
+            # ── NO regime breakout suppression ──
+            # Removed: was net negative in backtest (v2 composite -1.95 vs v1 -1.38)
+            # Regime still modulates exposure via risk_mgr.set_regime_multiplier()
 
-            # ── BTC lead-lag filter ──
+            # ── BTC lead-lag filter (kept — crash protection is valuable) ──
             if sig["action"] == "BUY" and pair != "BTC/USD":
                 if self.sentiment.should_skip_altcoin_buys():
                     sig["action"] = "HOLD"
                     sig["strategy"] = "btc_crash_filter"
 
-                # BTC momentum boost for breakout entries
                 if sig["strategy"] == "breakout":
                     sig["strength"] = min(1.0, sig["strength"] + self.sentiment.get_btc_signal_boost())
 
@@ -300,20 +285,25 @@ class TradingBot:
                 continue
 
             self.risk_mgr.update_trailing_stop(pair, price)
-            should_exit, reason = self.risk_mgr.check_trailing_stop(pair, price)
+            should_exit, reason, exit_fraction = self.risk_mgr.check_trailing_stop(pair, price)
             if should_exit:
-                log.info(f"STOP EXIT [{reason}]: {pair} @ {price}")
+                sell_qty = qty * exit_fraction
                 bid = tick.get("MaxBid", 0)
                 ask = tick.get("MinAsk", 0)
-                self.executor.sell(pair, qty, price, bid, ask, use_limit=False)
 
-                # Feed result to ML
-                stop_info = self.risk_mgr.clear_trailing_stop(pair)
-                if stop_info and pair in self.entry_features:
-                    pnl = (price - stop_info["entry_price"]) / stop_info["entry_price"]
-                    self.ml_gate.record_trade(self.entry_features.pop(pair), profitable=(pnl > 0))
+                # Use LIMIT orders for non-urgent exits (saves 0.05% per trade)
+                # Only hard stops and breakdowns need market orders for speed
+                urgent = reason in ("hard_stop",)
+                log.info(f"STOP EXIT [{reason}]: {pair} @ {price} "
+                         f"({'PARTIAL 50%' if exit_fraction < 1 else 'FULL'} "
+                         f"{'MARKET' if urgent else 'LIMIT'})")
+                self.executor.sell(pair, sell_qty, price, bid, ask, use_limit=not urgent)
 
-                self.positions[pair] = 0
+                if exit_fraction >= 1.0:
+                    self.risk_mgr.clear_trailing_stop(pair)
+                    self.positions[pair] = 0
+                else:
+                    self.positions[pair] = qty - sell_qty
 
         # ── 7. Execute buy signals ──
         total_exposure = self._get_total_exposure_usd(ticker_data)
@@ -333,26 +323,6 @@ class TradingBot:
             if price <= 0:
                 continue
 
-            # ── ML confidence gate ──
-            # bars_per_hour=12 for 5-min candles (matches hour-based feature semantics)
-            ml_features = self.ml_gate.build_features(
-                self.binance.get_closes(pair),
-                self.binance.get_highs(pair),
-                self.binance.get_lows(pair),
-                self.binance.get_volumes(pair),
-                sig,
-                deriv_signals.get(pair, {}),
-                self.sentiment.btc_1h_return,
-                self.regime.current_regime,
-                bars_per_hour=12,
-            )
-            if ml_features is not None:
-                ml_approved, ml_conf = self.ml_gate.should_enter(ml_features)
-                if not ml_approved and self.ml_gate.is_trained:
-                    log.debug(f"ML REJECTED: {pair} conf={ml_conf:.2f}")
-                    continue
-
-            # ── Position sizing ──
             deriv_score = sig.get("deriv_score", 0)
             size_usd = self.risk_mgr.position_size_usd(
                 pair, sig["real_vol"], total_exposure, num_positions,
@@ -379,10 +349,7 @@ class TradingBot:
                         pair, price,
                         strategy=sig["strategy"],
                         entry_price=detail.get("FilledAverPrice", price),
-                        entry_features=ml_features,
                     )
-                    if ml_features is not None:
-                        self.entry_features[pair] = ml_features
                     total_exposure += size_usd
                     num_positions = sum(1 for q in self.positions.values() if q > 0)
 
@@ -398,21 +365,15 @@ class TradingBot:
                 if dd_check["action"] == "reduce":
                     qty *= dd_check["reduce_pct"]
 
+                # Breakdowns are urgent (market order), RSI sells are not (limit)
                 urgent = sig.get("breakdown", False)
-                log.info(f"SELL [{sig['strategy']}]: {pair} rsi={sig['rsi']:.0f} qty={qty}")
+                log.info(f"SELL [{sig['strategy']}]: {pair} rsi={sig['rsi']:.0f} qty={qty} "
+                         f"{'MARKET' if urgent else 'LIMIT'}")
                 self.executor.sell(pair, qty, price, bid, ask, use_limit=not urgent)
 
-                stop_info = self.risk_mgr.clear_trailing_stop(pair)
-                if stop_info and pair in self.entry_features:
-                    pnl = (price - stop_info["entry_price"]) / stop_info["entry_price"]
-                    self.ml_gate.record_trade(self.entry_features.pop(pair), profitable=(pnl > 0))
+                self.risk_mgr.clear_trailing_stop(pair)
 
-        # ── 9. Periodic ML retraining ──
-        if self.cycle_count % 288 == 0:  # every ~24h
-            if self.ml_gate.retrain_if_ready():
-                log.info("ML model retrained")
-
-        # ── 10. Logging ──
+        # ── 9. Logging ──
         self._log_cycle(ticker_data, portfolio_value, signals, dd_check)
 
         if self.cycle_count % 12 == 0:
@@ -442,12 +403,6 @@ class TradingBot:
             bid = tick.get("MaxBid", 0)
             ask = tick.get("MinAsk", 0)
             self.executor.sell(pair, qty, price, bid, ask, use_limit=False)
-
-            stop_info = self.risk_mgr.clear_trailing_stop(pair)
-            if stop_info and pair in self.entry_features:
-                pnl = (price - stop_info["entry_price"]) / stop_info["entry_price"]
-                self.ml_gate.record_trade(self.entry_features.pop(pair), profitable=(pnl > 0))
-
         self.positions.clear()
 
     def _log_cycle(self, ticker_data: dict, portfolio_value: float, signals: dict, dd_check: dict):
@@ -466,7 +421,6 @@ class TradingBot:
             "regime": self.regime.get_status(),
             "sentiment": self.sentiment.get_status(),
             "risk": self.risk_mgr.get_status(),
-            "ml": self.ml_gate.get_status(),
             "drawdown_action": dd_check["action"],
             "metrics": self.perf.summary(),
         })
@@ -475,10 +429,11 @@ class TradingBot:
         global _running
 
         log.info("=" * 60)
-        log.info("TRADING BOT v2 STARTING")
+        log.info("TRADING BOT v3 STARTING")
         log.info(f"Poll interval: {POLL_INTERVAL_SECONDS}s")
         log.info(f"Active pairs: {len(self.active_pairs)}")
-        log.info(f"Modules: regime=HMM, derivatives=funding+OI, sentiment=FnG+BTC, ml=LightGBM")
+        log.info(f"Modules: regime=HMM(exposure only), derivatives=funding+OI, sentiment=FnG+BTC")
+        log.info(f"ML gate: DISABLED (no alpha in temporal CV)")
         log.info("=" * 60)
 
         self.load_historical_data()

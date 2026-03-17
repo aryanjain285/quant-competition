@@ -64,11 +64,20 @@ class RegimeDetector:
             self._fit_fallback(btc_closes)
             return
 
+        # Resample to hourly if data is sub-hourly (e.g. 5-min candles)
+        # Regime should operate on daily timescales, not intra-hour noise
         prices = btc_closes[-lookback:]
+        if len(prices) > 2000:
+            # Likely 5-min data (1000 bars = ~3.5 days). Resample to hourly.
+            trim = len(prices) % 12
+            if trim > 0:
+                prices = prices[trim:]
+            prices = prices.reshape(-1, 12)[:, -1]  # take last close per hour
+
         log_returns = np.diff(np.log(prices))
 
         # Feature matrix: [returns, rolling_vol]
-        # Rolling volatility over 24-period window
+        # Rolling volatility over 24-HOUR window (24 bars after resampling)
         vol_window = 24
         rolling_vol = np.array([
             np.std(log_returns[max(0, i - vol_window):i]) if i > vol_window else np.std(log_returns[:i+1])
@@ -149,10 +158,18 @@ class RegimeDetector:
             self.fit(btc_closes)
             return
 
-        if len(btc_closes) < 30:
+        if len(btc_closes) < 300:
             return
 
-        log_returns = np.diff(np.log(btc_closes[-30:]))
+        # Resample to hourly for regime prediction (same as fit)
+        recent = btc_closes[-360:]  # last 30 hours of 5-min data
+        if len(recent) > 60:
+            trim = len(recent) % 12
+            if trim > 0:
+                recent = recent[trim:]
+            recent = recent.reshape(-1, 12)[:, -1]
+
+        log_returns = np.diff(np.log(recent))
         vol_window = min(24, len(log_returns) - 1)
         rolling_vol = np.std(log_returns[-vol_window:]) if vol_window > 0 else 0
 
