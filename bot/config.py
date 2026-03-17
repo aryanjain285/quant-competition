@@ -24,7 +24,8 @@ API_SECRET = os.getenv("ROOSTOO_API_SECRET", "")
 BASE_URL = os.getenv("ROOSTOO_BASE_URL", "https://mock-api.roostoo.com")
 
 # --- Binance (public, no auth needed) ---
-BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://data-api.binance.vision")
+BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
+BINANCE_FUTURES_URL = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com")
 
 # --- Timing ---
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL", "300"))  # 5 minutes
