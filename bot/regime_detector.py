@@ -1,17 +1,22 @@
 """
-Market regime detection using Hidden Markov Models.
+Market regime detector v4: rule-based + HMM ensemble.
 
-Fits a 2-state Gaussian HMM on BTC returns + volatility to identify:
-  State 0: Low-volatility trending regime  → be aggressive (breakout strategy)
-  State 1: High-volatility choppy regime   → be defensive (mean reversion, smaller sizes)
+Primary: rule-based regime score from cross-sectional market features
+  (breadth, trend strength, downside stress, cost stress).
+  More interpretable than HMM, grounded in observable market structure.
 
-Research basis:
-- HMMs increase Sharpe by filtering trades in wrong-regime conditions
-- QuantInsti: "train specialist models per regime"
-- Academic: HMMs detect regime changes in cryptoasset markets (ResearchGate 2020)
+Secondary: HMM on BTC as a confirmation signal.
+  If both agree → high confidence. If they disagree → use the more conservative.
 
-The detector runs on BTC because BTC drives market-wide regime.
-Individual altcoin signals still come from signals.py.
+Three regime states:
+  TREND_SUPPORTIVE: breadth high, trend positive, stress low
+    → trade freely, full exposure budget
+  SELECTIVE: mixed signals, moderate stress
+    → trade cautiously, reduced exposure, only top-ranked candidates
+  HOSTILE: breadth low, trend negative, stress high
+    → minimal or no new longs, prefer cash
+
+Output: exposure multiplier (0.2 to 1.0) fed to risk_manager.
 """
 import warnings
 import numpy as np
@@ -19,7 +24,6 @@ from typing import Optional
 from bot.logger import get_logger
 
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn")
-
 log = get_logger("regime")
 
 try:
@@ -27,142 +31,130 @@ try:
     HMM_AVAILABLE = True
 except ImportError:
     HMM_AVAILABLE = False
-    log.warning("hmmlearn not installed — regime detection will use fallback volatility method")
+
+# Regime states
+TREND_SUPPORTIVE = 0
+SELECTIVE = 1
+HOSTILE = 2
+REGIME_NAMES = {0: "TREND_SUPPORTIVE", 1: "SELECTIVE", 2: "HOSTILE"}
+
+# Exposure multipliers per state
+EXPOSURE_MULTIPLIERS = {
+    TREND_SUPPORTIVE: 1.0,
+    SELECTIVE: 0.6,
+    HOSTILE: 0.25,
+}
 
 
 class RegimeDetector:
-    """Detects market regime using BTC data.
-
-    Two regimes:
-        TRENDING (0): low vol, directional — favor breakout, full exposure
-        VOLATILE (1): high vol, choppy — favor mean-reversion, reduce exposure
-    """
-
-    TRENDING = 0
-    VOLATILE = 1
-    REGIME_NAMES = {0: "TRENDING", 1: "VOLATILE"}
+    """Detects market regime from cross-sectional + BTC features."""
 
     def __init__(self):
-        self.model: Optional[GaussianHMM] = None
-        self.is_fitted = False
-        self.current_regime = self.TRENDING
+        self.current_regime = SELECTIVE  # start cautious
         self.regime_confidence = 0.5
-        self.regime_history: list[int] = []
+        self.rule_regime = SELECTIVE
+        self.hmm_regime = SELECTIVE
+        self.market_features = {}
 
-        # Fallback volatility-based detection
-        self.vol_baseline: float = 0.0
+        # HMM state
+        self.hmm_model: Optional[GaussianHMM] = None
+        self.hmm_fitted = False
+        self._hmm_state_map = {}
 
-    def fit(self, btc_closes: np.ndarray, lookback: int = 720):
-        """Fit HMM on BTC returns and volatility.
+    # ─── Rule-Based Regime (Primary) ─────────────────────────────
 
-        Args:
-            btc_closes: array of BTC close prices (hourly or 5-min)
-            lookback: number of periods to use for fitting
+    def classify_regime_rules(self, market_features: dict) -> int:
+        """Classify regime from market-level features.
+
+        Uses a simple additive score:
+          breadth helps, trend_strength helps,
+          mkt_downside_vol hurts, cost_stress hurts.
+        Then threshold into 3 states.
         """
-        if len(btc_closes) < max(lookback, 100):
-            log.warning(f"Not enough BTC data for regime fit ({len(btc_closes)} bars, need {lookback})")
-            self._fit_fallback(btc_closes)
+        breadth = market_features.get("breadth", 0.5)
+        trend = market_features.get("trend_strength", 0)
+        downside = market_features.get("mkt_downside_vol", 0)
+        cost = market_features.get("cost_stress", 0)
+
+        # Normalize downside vol and cost to [0, 1] range roughly
+        # These are medians across universe — typical values:
+        #   downside_vol: 0.2-0.8 annualized
+        #   cost_stress: 0.0001-0.001 (spread %)
+        downside_norm = min(1.0, downside / 0.5) if downside > 0 else 0
+        cost_norm = min(1.0, cost / 0.001) if cost > 0 else 0
+
+        # Regime score: higher = more bullish
+        # Breadth > 0.6 is bullish, < 0.4 is bearish
+        # Trend > 0 is bullish
+        score = (
+            (breadth - 0.5) * 2.0       # [-1, +1] contribution
+            + np.clip(trend * 20, -1, 1)  # scale small returns to [-1, +1]
+            - downside_norm * 0.5         # penalty for stress
+            - cost_norm * 0.3             # penalty for poor conditions
+        )
+
+        if score > 0.3:
+            return TREND_SUPPORTIVE
+        elif score < -0.3:
+            return HOSTILE
+        else:
+            return SELECTIVE
+
+    # ─── HMM Regime (Secondary) ──────────────────────────────────
+
+    def fit_hmm(self, btc_closes: np.ndarray, lookback: int = 720):
+        """Fit 2-state HMM on BTC. Resamples 5-min data to hourly."""
+        if not HMM_AVAILABLE or len(btc_closes) < 200:
             return
 
-        # Resample to hourly if data is sub-hourly (e.g. 5-min candles)
-        # Regime should operate on daily timescales, not intra-hour noise
         prices = btc_closes[-lookback:]
+        # Resample to hourly if sub-hourly
         if len(prices) > 2000:
-            # Likely 5-min data (1000 bars = ~3.5 days). Resample to hourly.
             trim = len(prices) % 12
             if trim > 0:
                 prices = prices[trim:]
-            prices = prices.reshape(-1, 12)[:, -1]  # take last close per hour
+            prices = prices.reshape(-1, 12)[:, -1]
 
         log_returns = np.diff(np.log(prices))
-
-        # Feature matrix: [returns, rolling_vol]
-        # Rolling volatility over 24-HOUR window (24 bars after resampling)
         vol_window = 24
         rolling_vol = np.array([
-            np.std(log_returns[max(0, i - vol_window):i]) if i > vol_window else np.std(log_returns[:i+1])
+            np.std(log_returns[max(0, i - vol_window):i]) if i > vol_window else np.std(log_returns[:i + 1])
             for i in range(len(log_returns))
         ])
-
         features = np.column_stack([log_returns, rolling_vol])
-
-        # Remove any NaN/inf
         mask = np.all(np.isfinite(features), axis=1)
         features = features[mask]
 
         if len(features) < 50:
-            log.warning("Not enough valid features for HMM")
-            self._fit_fallback(btc_closes)
-            return
-
-        if not HMM_AVAILABLE:
-            self._fit_fallback(btc_closes)
             return
 
         try:
-            self.model = GaussianHMM(
-                n_components=2,
-                covariance_type="full",
-                n_iter=100,
-                random_state=42,
-            )
-            self.model.fit(features)
+            self.hmm_model = GaussianHMM(n_components=2, covariance_type="full",
+                                          n_iter=100, random_state=42)
+            self.hmm_model.fit(features)
 
-            # Identify which state is "trending" vs "volatile"
-            # The state with lower volatility mean is the trending state
-            vol_means = self.model.means_[:, 1]  # column 1 = rolling vol
+            vol_means = self.hmm_model.means_[:, 1]
             if vol_means[0] <= vol_means[1]:
-                # State 0 is already low-vol (trending)
-                self._state_map = {0: self.TRENDING, 1: self.VOLATILE}
+                self._hmm_state_map = {0: TREND_SUPPORTIVE, 1: SELECTIVE}
             else:
-                # Swap
-                self._state_map = {0: self.VOLATILE, 1: self.TRENDING}
+                self._hmm_state_map = {0: SELECTIVE, 1: TREND_SUPPORTIVE}
 
-            # Get current regime
-            states = self.model.predict(features)
-            self.current_regime = self._state_map[states[-1]]
-
-            # Confidence from posterior probabilities
-            probs = self.model.predict_proba(features)
-            last_probs = probs[-1]
-            self.regime_confidence = float(np.max(last_probs))
-
-            self.is_fitted = True
-            log.info(
-                f"HMM fitted: current regime={self.REGIME_NAMES[self.current_regime]} "
-                f"confidence={self.regime_confidence:.2f} "
-                f"vol_means={vol_means}"
-            )
-
+            states = self.hmm_model.predict(features)
+            self.hmm_regime = self._hmm_state_map.get(states[-1], SELECTIVE)
+            self.hmm_fitted = True
+            log.info(f"HMM fitted: state={REGIME_NAMES[self.hmm_regime]}")
         except Exception as e:
-            log.error(f"HMM fitting failed: {e}, using fallback")
-            self._fit_fallback(btc_closes)
+            log.debug(f"HMM fit failed: {e}")
 
-    def _fit_fallback(self, closes: np.ndarray):
-        """Fallback: use simple volatility threshold for regime detection."""
-        if len(closes) < 50:
-            return
-
-        log_returns = np.diff(np.log(closes[-288:]))  # last ~24h or available
-        self.vol_baseline = float(np.std(log_returns))
-        self.is_fitted = True
-        log.info(f"Regime fallback: using vol baseline={self.vol_baseline:.6f}")
-
-    def update(self, btc_closes: np.ndarray):
-        """Update regime state with latest BTC data.
-
-        Call this every cycle. Does NOT re-fit the model — just predicts
-        the current state using the existing model.
-        """
-        if not self.is_fitted:
-            self.fit(btc_closes)
+    def update_hmm(self, btc_closes: np.ndarray):
+        """Lightweight HMM predict (no refit)."""
+        if not self.hmm_fitted or self.hmm_model is None:
             return
 
         if len(btc_closes) < 300:
             return
 
-        # Resample to hourly for regime prediction (same as fit)
-        recent = btc_closes[-360:]  # last 30 hours of 5-min data
+        recent = btc_closes[-360:]
         if len(recent) > 60:
             trim = len(recent) % 12
             if trim > 0:
@@ -173,66 +165,57 @@ class RegimeDetector:
         vol_window = min(24, len(log_returns) - 1)
         rolling_vol = np.std(log_returns[-vol_window:]) if vol_window > 0 else 0
 
-        if self.model is not None and HMM_AVAILABLE:
-            try:
-                features = np.column_stack([log_returns[-5:], [rolling_vol] * 5])
-                if np.all(np.isfinite(features)):
-                    states = self.model.predict(features)
-                    self.current_regime = self._state_map[states[-1]]
+        try:
+            features = np.column_stack([log_returns[-5:], [rolling_vol] * 5])
+            if np.all(np.isfinite(features)):
+                states = self.hmm_model.predict(features)
+                self.hmm_regime = self._hmm_state_map.get(states[-1], SELECTIVE)
+        except Exception:
+            pass
 
-                    probs = self.model.predict_proba(features)
-                    self.regime_confidence = float(np.max(probs[-1]))
-            except Exception as e:
-                log.debug(f"HMM predict failed: {e}, using fallback")
-                self._update_fallback(rolling_vol)
+    # ─── Combined Regime Decision ────────────────────────────────
+
+    def update(self, market_features: dict, btc_closes: np.ndarray = None):
+        """Update regime from market features + optional BTC HMM.
+
+        The combination logic:
+          - If both agree → high confidence, use that state
+          - If they disagree → use the MORE CONSERVATIVE of the two
+          This prevents the regime detector from being overly bullish.
+        """
+        self.market_features = market_features
+
+        # Rule-based (primary)
+        self.rule_regime = self.classify_regime_rules(market_features)
+
+        # HMM (secondary)
+        if btc_closes is not None and len(btc_closes) > 100:
+            self.update_hmm(btc_closes)
+
+        # Combine: use more conservative of the two
+        if self.hmm_fitted:
+            # Higher number = more conservative (HOSTILE > SELECTIVE > TREND_SUPPORTIVE)
+            self.current_regime = max(self.rule_regime, self.hmm_regime)
+            self.regime_confidence = 1.0 if self.rule_regime == self.hmm_regime else 0.6
         else:
-            self._update_fallback(rolling_vol)
-
-        self.regime_history.append(self.current_regime)
-        # Keep last 2000
-        if len(self.regime_history) > 2000:
-            self.regime_history = self.regime_history[-2000:]
-
-    def _update_fallback(self, current_vol: float):
-        """Fallback regime detection: vol > 1.5x baseline = volatile."""
-        if self.vol_baseline > 0:
-            if current_vol > 1.5 * self.vol_baseline:
-                self.current_regime = self.VOLATILE
-                self.regime_confidence = min(1.0, current_vol / (2 * self.vol_baseline))
-            else:
-                self.current_regime = self.TRENDING
-                self.regime_confidence = min(1.0, 1 - current_vol / (1.5 * self.vol_baseline))
+            self.current_regime = self.rule_regime
+            self.regime_confidence = 0.7
 
     def get_exposure_multiplier(self) -> float:
-        """Get recommended exposure multiplier based on regime.
+        return EXPOSURE_MULTIPLIERS.get(self.current_regime, 0.6)
 
-        TRENDING: 1.0 (full exposure)
-        VOLATILE: 0.4-0.6 (reduced exposure)
-        """
-        if self.current_regime == self.VOLATILE:
-            # Scale by confidence: more confident it's volatile = lower exposure
-            return max(0.3, 0.6 - 0.3 * self.regime_confidence)
-        else:
-            return 1.0
-
-    def get_strategy_preference(self) -> str:
-        """Get which strategy should be prioritized in current regime.
-
-        TRENDING: 'breakout' (catch momentum)
-        VOLATILE: 'mean_rev' (fade extremes)
-        """
-        return "breakout" if self.current_regime == self.TRENDING else "mean_rev"
-
-    def should_skip_breakout(self) -> bool:
-        """Whether to suppress breakout entries (volatile regime, high confidence)."""
-        return self.current_regime == self.VOLATILE and self.regime_confidence > 0.7
+    def should_trade(self) -> bool:
+        """Whether the regime allows ANY new longs."""
+        return self.current_regime != HOSTILE
 
     def get_status(self) -> dict:
         return {
-            "regime": self.REGIME_NAMES.get(self.current_regime, "UNKNOWN"),
+            "regime": REGIME_NAMES.get(self.current_regime, "UNKNOWN"),
+            "rule_regime": REGIME_NAMES.get(self.rule_regime, "UNKNOWN"),
+            "hmm_regime": REGIME_NAMES.get(self.hmm_regime, "UNKNOWN"),
             "confidence": round(self.regime_confidence, 3),
             "exposure_mult": round(self.get_exposure_multiplier(), 3),
-            "strategy_pref": self.get_strategy_preference(),
-            "is_fitted": self.is_fitted,
-            "method": "hmm" if (self.model is not None and HMM_AVAILABLE) else "fallback",
+            "should_trade": self.should_trade(),
+            "market_features": self.market_features,
+            "hmm_fitted": self.hmm_fitted,
         }

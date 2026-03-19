@@ -1,314 +1,221 @@
 """
-Signal engine v3: Reduced overtrading, higher conviction entries.
+Signal engine v4: Event filter using continuation/reversal framework.
 
-Changes from v2:
-  - Breakout entries REQUIRE volume confirmation (mandatory, not bonus)
-  - RSI oversold threshold tightened from 30 → 25 (fewer false entries)
-  - Breakout strength baseline raised from 0.6 → 0.65
+Replaces v3's breakout/RSI with grounded event detection:
 
-These changes reduce trade count by ~40-50% while keeping the highest-
-conviction entries. Commission drag drops proportionally.
+  1. CONTINUATION setup: coin is trending up cleanly with volume.
+     Fires when: breakout_distance > 0, r_24h > 0, persistence high,
+     choppiness low, risk/cost acceptable, volume confirmed.
+     "It is moving up, the move is clean, it is not too dangerous,
+      and it is not too expensive to trade."
 
-Two independent signal sources:
-1. BREAKOUT — new N-hour highs WITH volume confirmation
-2. RSI MEAN REVERSION — deeply oversold bounces (RSI < 25)
+  2. REVERSAL setup: coin has dropped unusually hard, bounce potential.
+     Fires when: overshoot extreme (standardized drop vs own history),
+     risk elevated but not catastrophic, cost acceptable.
+     "The coin fell much more than normal, but conditions still allow
+      a bounce trade."
+
+Both use features computed in features.py (persistence, choppiness,
+risk/cost penalties, overshoot). Volume confirmation is MANDATORY
+for continuation (proven in v3 backtest: single biggest improvement).
+
+Pure functions — same code runs in backtest and live.
 """
 import numpy as np
+from bot.features import (
+    compute_coin_features, zscore_universe, compute_submodel_scores,
+)
 
 
-# ─────────────────────────────────────────────────────────────────
-# Core indicators
-# ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# EVENT DETECTION (replaces breakout_signal / mean_reversion_signal)
+# ═══════════════════════════════════════════════════════════════
 
-def ema(prices: np.ndarray, span: int) -> np.ndarray:
-    """Exponential moving average."""
-    if len(prices) < 2:
-        return prices.copy()
-    alpha = 2.0 / (span + 1)
-    out = np.empty_like(prices, dtype=float)
-    out[0] = prices[0]
-    for i in range(1, len(prices)):
-        out[i] = alpha * prices[i] + (1 - alpha) * out[i - 1]
-    return out
+def check_continuation(features: dict, zscored: dict) -> dict:
+    """Check if a coin shows a valid continuation (trend-following) setup.
 
-
-def rsi(prices: np.ndarray, period: int = 14) -> float:
-    """Relative Strength Index. Returns latest RSI value (0-100)."""
-    if len(prices) < period + 2:
-        return 50.0
-    deltas = np.diff(prices[-(period + 1):])
-    gains = np.mean(deltas[deltas > 0]) if np.any(deltas > 0) else 0.0
-    losses = np.mean(-deltas[deltas < 0]) if np.any(deltas < 0) else 0.0
-    if losses == 0:
-        return 100.0
-    rs = gains / losses
-    return float(100 - (100 / (1 + rs)))
-
-
-def realized_volatility(prices: np.ndarray, lookback: int = 288) -> float:
-    """Annualized realized volatility from log returns."""
-    if len(prices) < lookback + 1:
-        lookback = len(prices) - 1
-    if lookback < 2:
-        return 0.0
-    log_returns = np.diff(np.log(prices[-lookback - 1:]))
-    return float(np.std(log_returns)) * np.sqrt(288 * 365)
-
-
-def downside_volatility(prices: np.ndarray, lookback: int = 288) -> float:
-    """Annualized downside volatility (only negative returns)."""
-    if len(prices) < lookback + 1:
-        lookback = len(prices) - 1
-    if lookback < 2:
-        return 0.0
-    log_returns = np.diff(np.log(prices[-lookback - 1:]))
-    neg_returns = log_returns[log_returns < 0]
-    if len(neg_returns) == 0:
-        return 0.0
-    return float(np.std(neg_returns)) * np.sqrt(288 * 365)
-
-
-def atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> float:
-    """Average True Range (last value)."""
-    if len(closes) < period + 1:
-        return 0.0
-    if len(highs) >= period + 1 and len(lows) >= period + 1:
-        tr = np.maximum(
-            highs[-period:] - lows[-period:],
-            np.maximum(
-                np.abs(highs[-period:] - closes[-period - 1:-1]),
-                np.abs(lows[-period:] - closes[-period - 1:-1]),
-            ),
-        )
-    else:
-        tr = np.abs(np.diff(closes[-(period + 1):]))
-    return float(np.mean(tr))
-
-
-def spread_pct(bid: float, ask: float) -> float:
-    """Bid-ask spread as percentage of mid price."""
-    if bid <= 0 or ask <= 0:
-        return 0.0
-    mid = (bid + ask) / 2
-    return (ask - bid) / mid
-
-
-# ─────────────────────────────────────────────────────────────────
-# Signal 1: BREAKOUT (volume confirmation REQUIRED)
-# ─────────────────────────────────────────────────────────────────
-
-def breakout_signal(
-    closes: np.ndarray,
-    highs: np.ndarray,
-    lows: np.ndarray,
-    volumes: np.ndarray,
-    lookback: int = 72,
-) -> dict:
-    """Detect breakout: price exceeding recent N-period high.
-
-    Returns dict with:
-        - is_breakout: bool (True only if BOTH price breaks out AND volume confirms)
-        - is_breakdown: bool
-        - strength: how far above the prior high
-        - volume_confirm: whether volume supports the move
+    Uses raw features for thresholds, z-scored for scoring.
+    Returns {"valid": bool, "strength": float, "reasons": list}
     """
-    result = {
-        "is_breakout": False,
-        "is_breakdown": False,
-        "strength": 0.0,
-        "volume_confirm": False,
-    }
+    result = {"valid": False, "strength": 0.0, "reasons": []}
 
+    # All conditions must pass (conjunction — avoids false entries)
+    # 1. Price above recent high (breakout distance > 0)
+    if features.get("breakout_distance", 0) <= 0:
+        return result
+    result["reasons"].append("breakout")
+
+    # 2. Medium-horizon return positive (24h)
+    if features.get("r_24h", 0) <= 0:
+        return result
+    result["reasons"].append("r24h_positive")
+
+    # 3. Persistence high (move is internally consistent)
+    if features.get("persistence", 0.5) < 0.52:
+        return result
+    result["reasons"].append("persistent")
+
+    # 4. Choppiness low (path is clean)
+    if features.get("choppiness", 0.5) > 0.85:
+        return result
+    result["reasons"].append("clean_path")
+
+    # 5. Volume confirmed (mandatory — v3 proven)
+    if features.get("volume_ratio", 1.0) < 1.3:
+        return result
+    result["reasons"].append("volume")
+
+    # 6. Risk penalty not extreme (z-scored)
+    if zscored.get("risk_penalty", 0) > 1.5:
+        return result
+    result["reasons"].append("risk_ok")
+
+    # 7. Cost penalty not extreme (z-scored)
+    if zscored.get("cost_penalty", 0) > 1.5:
+        return result
+    result["reasons"].append("cost_ok")
+
+    # All passed — valid continuation
+    result["valid"] = True
+
+    # Strength: based on how strong the features are
+    strength = 0.5
+    strength += min(0.15, features["breakout_distance"] * 5)  # stronger breakout
+    strength += min(0.10, features["r_24h"] * 2)               # stronger momentum
+    strength += 0.05 if features["persistence"] > 0.58 else 0  # extra clean
+    strength += 0.05 if features["volume_ratio"] > 2.0 else 0  # strong volume
+    strength -= 0.05 if zscored.get("risk_penalty", 0) > 0.5 else 0  # risk discount
+    result["strength"] = round(min(strength, 1.0), 3)
+
+    return result
+
+
+def check_reversal(features: dict, zscored: dict) -> dict:
+    """Check if a coin shows a valid reversal (mean-reversion) setup.
+
+    Uses overshoot score: standardized recent drop vs coin's own history.
+    Returns {"valid": bool, "strength": float, "reasons": list}
+    """
+    result = {"valid": False, "strength": 0.0, "reasons": []}
+
+    # Overshoot must be extreme (large negative z-score = unusually large drop)
+    overshoot = features.get("overshoot", 0)
+    if overshoot > -1.5:
+        # Not oversold enough — overshoot is negative for drops
+        return result
+    result["reasons"].append(f"oversold(z={overshoot:.1f})")
+
+    # Risk must be elevated but not catastrophic
+    # High risk = the coin moved a lot = there's something to revert
+    # But if risk is extreme, it might be a real crash not a bounce candidate
+    risk_z = zscored.get("risk_penalty", 0)
+    if risk_z > 2.5:
+        return result  # too dangerous
+    result["reasons"].append("risk_manageable")
+
+    # Cost must be acceptable
+    if zscored.get("cost_penalty", 0) > 1.5:
+        return result
+    result["reasons"].append("cost_ok")
+
+    # Recent price action should show some stabilization
+    # (not free-falling — r_1h should not be deeply negative)
+    r_1h = features.get("r_1h", 0)
+    if r_1h < -0.03:
+        return result  # still crashing, don't catch falling knife
+    result["reasons"].append("stabilizing")
+
+    result["valid"] = True
+
+    # Strength: deeper overshoot = stronger signal
+    strength = 0.4
+    strength += min(0.25, abs(overshoot) * 0.1)  # deeper = stronger
+    strength += 0.1 if r_1h > 0 else 0            # already bouncing = bonus
+    strength -= 0.05 if risk_z > 1.0 else 0        # risk discount
+    result["strength"] = round(min(strength, 1.0), 3)
+
+    return result
+
+
+def check_breakdown(closes: np.ndarray, lows: np.ndarray, lookback: int = 72) -> bool:
+    """Check if price has broken below recent low (exit signal)."""
     if len(closes) < lookback + 1:
-        return result
-
-    if len(highs) >= lookback + 1:
-        prior_high = np.max(highs[-(lookback + 1):-1])
+        return False
+    breakdown_lb = max(lookback // 3, 12)
+    if len(lows) >= breakdown_lb + 1:
+        prior_low = np.min(lows[-breakdown_lb - 1:-1])
     else:
-        prior_high = np.max(closes[-(lookback + 1):-1])
-
-    if len(lows) >= lookback + 1:
-        breakdown_lookback = max(lookback // 3, 12)
-        prior_low = np.min(lows[-breakdown_lookback - 1:-1])
-    else:
-        breakdown_lookback = max(lookback // 3, 12)
-        prior_low = np.min(closes[-breakdown_lookback - 1:-1])
-
-    current = closes[-1]
-
-    # Volume confirmation: current volume > 1.3x recent average
-    vol_confirmed = False
-    if len(volumes) >= lookback:
-        avg_vol = np.mean(volumes[-lookback:-1])
-        if avg_vol > 0 and volumes[-1] > 1.3 * avg_vol:
-            vol_confirmed = True
-    result["volume_confirm"] = vol_confirmed
-
-    # Breakout: price exceeds prior high AND volume confirms
-    # This is the key change — volume is now REQUIRED, not a bonus
-    if current > prior_high and prior_high > 0 and vol_confirmed:
-        result["is_breakout"] = True
-        result["strength"] = (current - prior_high) / prior_high
-
-    # Breakdown: price falls below recent low (exit signal — no volume needed)
-    if current < prior_low and prior_low > 0:
-        result["is_breakdown"] = True
-
-    return result
+        prior_low = np.min(closes[-breakdown_lb - 1:-1])
+    return closes[-1] < prior_low and prior_low > 0
 
 
-# ─────────────────────────────────────────────────────────────────
-# Signal 2: RSI MEAN REVERSION (tightened threshold)
-# ─────────────────────────────────────────────────────────────────
-
-def mean_reversion_signal(
-    closes: np.ndarray,
-    rsi_oversold: float = 25.0,    # TIGHTENED from 30 — fewer, higher-conviction entries
-    rsi_overbought: float = 65.0,
-    rsi_period: int = 14,
-) -> dict:
-    """RSI-based mean reversion signal.
-
-    Buy when deeply oversold (RSI < 25), sell when overbought.
-    Tightened from 30 to reduce false entries and commission drag.
-    """
-    result = {
-        "is_oversold": False,
-        "is_overbought": False,
-        "rsi_value": 50.0,
-        "bounce_strength": 0.0,
-    }
-
-    if len(closes) < rsi_period + 10:
-        return result
-
-    current_rsi = rsi(closes, rsi_period)
-    result["rsi_value"] = round(current_rsi, 2)
-
-    if current_rsi < rsi_oversold:
-        result["is_oversold"] = True
-    elif current_rsi > rsi_overbought:
-        result["is_overbought"] = True
-
-    # Bounce strength: RSI rising from recent trough
-    rsi_history = []
-    for i in range(min(10, len(closes) - rsi_period - 1)):
-        idx = len(closes) - i
-        if idx > rsi_period + 1:
-            rsi_history.append(rsi(closes[:idx], rsi_period))
-    if len(rsi_history) >= 3:
-        recent_low = min(rsi_history)
-        result["bounce_strength"] = max(0, current_rsi - recent_low) / 100.0
-
-    return result
-
-
-# ─────────────────────────────────────────────────────────────────
-# Combined signal for one pair
-# ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# MAIN SIGNAL COMPUTATION (called by main.py for each coin)
+# ═══════════════════════════════════════════════════════════════
 
 def compute_signal(
+    raw_features: dict,
+    zscored_features: dict,
     closes: np.ndarray,
-    highs: np.ndarray,
     lows: np.ndarray,
-    volumes: np.ndarray,
-    bid: float,
-    ask: float,
     breakout_lookback: int = 72,
 ) -> dict:
-    """Compute all signals for one pair.
+    """Compute signal for one coin using continuation/reversal framework.
 
-    v3 changes:
-      - Breakout requires volume confirmation (baked into breakout_signal)
-      - RSI oversold at 25 (baked into mean_reversion_signal)
-      - Higher base strength for breakout (0.65 vs 0.6)
+    Args:
+        raw_features: raw per-coin features from features.py
+        zscored_features: z-scored version (with submodel scores)
+        closes: raw close prices (for breakdown detection)
+        lows: raw low prices (for breakdown detection)
+
+    Returns dict compatible with main.py:
+        action: "BUY" / "SELL" / "HOLD"
+        strategy: "continuation" / "reversal" / "breakdown" / "none"
+        strength: 0-1 signal confidence
+        + all feature values for logging
     """
     result = {
         "action": "HOLD",
         "strategy": "none",
         "strength": 0.0,
-
-        "breakout": False,
+        "continuation": {},
+        "reversal": {},
         "breakdown": False,
-        "breakout_strength": 0.0,
-        "volume_confirm": False,
-
-        "rsi": 50.0,
-        "oversold": False,
-        "overbought": False,
-        "bounce_strength": 0.0,
-
-        "real_vol": 0.0,
-        "down_vol": 0.0,
-        "spread": 0.0,
-        "atr": 0.0,
-
-        "ema_fast": 0.0,
-        "ema_slow": 0.0,
-        "trend_up": False,
+        # Pass through features for logging and derivatives overlay
+        "rsi": 50.0,  # not used for decisions anymore, kept for logging
+        "real_vol": raw_features.get("realized_vol", 0),
+        "down_vol": raw_features.get("downside_vol", 0),
+        "spread": raw_features.get("spread_pct", 0),
+        "breakout_strength": raw_features.get("breakout_distance", 0),
+        "volume_confirm": raw_features.get("volume_ratio", 1.0) > 1.3,
     }
 
-    if len(closes) < 80:
-        return result
+    # Check continuation (trend-following)
+    cont = check_continuation(raw_features, zscored_features)
+    result["continuation"] = cont
 
-    bo = breakout_signal(closes, highs, lows, volumes, breakout_lookback)
-    mr = mean_reversion_signal(closes)
+    # Check reversal (mean-reversion)
+    rev = check_reversal(raw_features, zscored_features)
+    result["reversal"] = rev
 
-    ema_f = ema(closes, 21)[-1]
-    ema_s = ema(closes, 55)[-1]
-    trend_up = closes[-1] > ema_f > ema_s
+    # Check breakdown (exit signal)
+    is_breakdown = check_breakdown(closes, lows, breakout_lookback)
+    result["breakdown"] = is_breakdown
 
-    real_vol = realized_volatility(closes)
-    down_vol = downside_volatility(closes)
-    current_atr = atr(highs, lows, closes) if len(highs) > 14 else 0.0
-    sprd = spread_pct(bid, ask)
-
-    result.update({
-        "breakout": bo["is_breakout"],
-        "breakdown": bo["is_breakdown"],
-        "breakout_strength": round(bo["strength"], 6),
-        "volume_confirm": bo["volume_confirm"],
-
-        "rsi": mr["rsi_value"],
-        "oversold": mr["is_oversold"],
-        "overbought": mr["is_overbought"],
-        "bounce_strength": round(mr["bounce_strength"], 4),
-
-        "real_vol": round(real_vol, 4),
-        "down_vol": round(down_vol, 4),
-        "spread": round(sprd, 6),
-        "atr": round(current_atr, 6),
-
-        "ema_fast": round(ema_f, 6),
-        "ema_slow": round(ema_s, 6),
-        "trend_up": trend_up,
-    })
-
-    # ── Decision logic ──
-    # Breakout: volume confirmation is already required inside breakout_signal
-    if bo["is_breakout"] and trend_up:
-        result["action"] = "BUY"
-        result["strategy"] = "breakout"
-        # Higher base (0.65) since volume is already confirmed
-        strength = 0.65 + min(0.35, bo["strength"] * 8)
-        result["strength"] = round(min(strength, 1.0), 3)
-
-    # RSI mean reversion: RSI < 25 required (tighter than before)
-    elif mr["is_oversold"] and not bo["is_breakdown"]:
-        result["action"] = "BUY"
-        result["strategy"] = "mean_rev"
-        strength = 0.5 + (0.2 if mr["rsi_value"] < 20 else 0) + (0.1 if trend_up else 0)
-        result["strength"] = round(strength, 3)
-
-    # Exit signals
-    elif bo["is_breakdown"]:
+    # Decision priority: breakdown > continuation > reversal
+    if is_breakdown:
         result["action"] = "SELL"
-        result["strategy"] = "breakout"
+        result["strategy"] = "breakdown"
         result["strength"] = 0.8
 
-    elif mr["is_overbought"] and mr["rsi_value"] > 70:
-        result["action"] = "SELL"
-        result["strategy"] = "mean_rev"
-        result["strength"] = 0.5
+    elif cont["valid"]:
+        result["action"] = "BUY"
+        result["strategy"] = "continuation"
+        result["strength"] = cont["strength"]
+
+    elif rev["valid"]:
+        result["action"] = "BUY"
+        result["strategy"] = "reversal"
+        result["strength"] = rev["strength"]
 
     return result
