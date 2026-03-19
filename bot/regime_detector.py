@@ -219,3 +219,34 @@ class RegimeDetector:
             "market_features": self.market_features,
             "hmm_fitted": self.hmm_fitted,
         }
+
+
+# --- market proxy regime detectio using principal component analysis --- 
+from sklearn.decomposition import PCA
+
+
+def compute_pc1_market_proxy(price_matrix: np.ndarray):
+    """
+    price_matrix shape: (time, assets)
+    returns:
+        synthetic_series: cumulative PC1 series for compatibility
+        pc1_scores: raw PC1 return-like factor scores
+        explained_var: variance explained by PC1
+    """
+    returns = np.log(price_matrix[1:] / price_matrix[:-1])
+    returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Standardize each asset so high-vol names do not dominate
+    mu = returns.mean(axis=0, keepdims=True)
+    sigma = returns.std(axis=0, keepdims=True)
+    sigma[sigma == 0] = 1.0
+    returns_z = (returns - mu) / sigma
+
+    pca = PCA(n_components=1)
+    pc1_scores = pca.fit_transform(returns_z).flatten()
+    explained_var = float(pca.explained_variance_ratio_[0])
+
+    # Compatibility hack for existing fit_hmm(closes)
+    synthetic_series = np.exp(np.insert(np.cumsum(pc1_scores), 0, 0.0))
+
+    return synthetic_series, pc1_scores, explained_var

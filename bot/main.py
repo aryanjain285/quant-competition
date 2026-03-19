@@ -158,13 +158,29 @@ class TradingBot:
 
     def load_historical_data(self):
         log.info("Loading historical data...")
-        self.binance.load_history(self.active_pairs, interval="5m", limit=1000)
+        self.binance.load_history(self.active_pairs, interval="1h", limit=1000)
         log.info("Loading derivatives data...")
         self.derivatives.load_all(self.active_pairs)
 
-        btc_closes = self.binance.get_closes("BTC/USD")
-        if len(btc_closes) > 100:
-            self.regime.fit_hmm(btc_closes)
+        # Build price matrix from loaded history
+        close_series = []
+        valid_pairs = []
+
+        for pair in self.active_pairs:
+            closes = self.binance.get_closes(pair)
+            if closes is not None and len(closes) >= 100:
+                close_series.append(np.array(closes, dtype=float))
+                valid_pairs.append(pair)
+
+        if len(close_series) >= 2:
+            min_len = min(len(x) for x in close_series)
+            close_series = [x[-min_len:] for x in close_series]
+            price_matrix = np.column_stack(close_series)
+
+            pc1_series, pc1_returns, pc1_var = compute_pc1_market_proxy(price_matrix)
+
+            if len(pc1_series) > 100:
+                self.regime.fit_hmm(pc1_series)
 
         self.sentiment.update_fear_greed()
         log.info("All historical data loaded.")
