@@ -30,6 +30,7 @@ import sys
 import signal
 import traceback
 import numpy as np
+from typing import Optional
 from datetime import datetime, timezone
 
 from bot.config import (
@@ -154,47 +155,26 @@ class TradingBot:
                 exposure += qty * ticker_data[pair].get("LastPrice", 0)
         return exposure
     
-    def _build_price_matrix(self, min_bars: int = 100):
-        """
-        Build a time x assets close-price matrix from currently loaded Binance history.
+    def _build_price_matrix(self, min_bars: int = 100) -> Optional[np.ndarray]:
+        """Build time × assets close-price matrix from loaded candles.
 
-        Returns:
-            price_matrix: np.ndarray of shape (time, assets) or None
-            valid_pairs: list[str]
+        Returns np.ndarray of shape (time, assets) or None.
         """
         close_series = []
-        valid_pairs = []
-
         for pair in self.active_pairs:
             closes = self.binance.get_closes(pair)
-            if closes is None:
+            if closes is None or len(closes) < min_bars:
                 continue
-            if len(closes) < min_bars:
-                continue
-
             arr = np.asarray(closes, dtype=float)
             if np.any(~np.isfinite(arr)):
                 continue
-
             close_series.append(arr)
-            valid_pairs.append(pair)
 
         if len(close_series) < 2:
-            log.warning("Price matrix build failed: fewer than 2 valid pairs with sufficient history")
-            return None, []
+            return None
 
         min_len = min(len(x) for x in close_series)
-        close_series = [x[-min_len:] for x in close_series]
-
-        price_matrix = np.column_stack(close_series)
-
-        log.info(
-            f"Built price matrix: shape={price_matrix.shape} "
-            f"(time={price_matrix.shape[0]}, assets={price_matrix.shape[1]}) "
-            f"from {len(valid_pairs)} pairs"
-        )
-
-        return price_matrix, valid_pairs
+        return np.column_stack([x[-min_len:] for x in close_series])
         
     # ─── Startup ────────────────────────────────────────────────
 
@@ -212,32 +192,19 @@ class TradingBot:
     #     log.info("All historical data loaded.")
 
     def load_historical_data(self):
-        log.info("Loading historical data...")
+        log.info("Loading historical data (1h candles)...")
         self.binance.load_history(self.active_pairs, interval="1h", limit=1000)
         log.info("Loading derivatives data...")
         self.derivatives.load_all(self.active_pairs)
 
-        # Build price matrix from loaded history
-        close_series = []
-        valid_pairs = []
-
-        for pair in self.active_pairs:
-            closes = self.binance.get_closes(pair)
-            if closes is not None and len(closes) >= 100:
-                close_series.append(np.array(closes, dtype=float))
-                valid_pairs.append(pair)
-
-        if len(close_series) >= 2:
-            min_len = min(len(x) for x in close_series)
-            close_series = [x[-min_len:] for x in close_series]
-            price_matrix = np.column_stack(close_series)
-
-            pc1_series, pc1_returns, pc1_var = self.regime.compute_pc1_market_proxy(price_matrix)
-
-            if len(pc1_series) > 100:
+        # Build price matrix and fit PCA + HMM
+        price_matrix = self._build_price_matrix()
+        if price_matrix is not None:
+            pc1_series, _, pc1_var, _ = self.regime.compute_pc1_market_proxy(price_matrix)
+            if pc1_series is not None and len(pc1_series) > 100:
                 self.regime.fit_hmm(pc1_series)
+                log.info(f"PCA-HMM fitted: PC1 explains {pc1_var:.1%} of variance")
 
-        # self.sentiment.update_fear_greed()
         log.info("All historical data loaded.")
 
     # ─── Main Cycle ─────────────────────────────────────────────
@@ -303,58 +270,24 @@ class TradingBot:
         # Market-level features for regime
         market_feats = compute_market_features(all_raw_features)
 
-        # # Update regime (rules + HMM)
-        # btc_closes = self.binance.get_closes("BTC/USD")
-        # self.regime.update(market_feats, btc_closes)
-        # if self.cycle_count % self.regime_refit_interval == 0:
-        #     self.regime.fit_hmm(btc_closes)
-
-        # self.risk_mgr.set_regime_multiplier(self.regime.get_exposure_multiplier())
-
-        # # Sentiment
-        # if self.cycle_count % 12 == 1:
-        #     self.sentiment.update_fear_greed()
-        # self.sentiment.update_btc_context(btc_closes.tolist() if len(btc_closes) > 0 else [])
-        # self.risk_mgr.set_sentiment_multiplier(self.sentiment.get_fg_exposure_multiplier())
-        
-        # Build rolling price matrix for PCA market proxy
-        close_series = []
-        for pair in self.active_pairs:
-            closes = self.binance.get_closes(pair)
-            if closes is not None and len(closes) >= 100:
-                close_series.append(np.array(closes, dtype=float))
-
+        # PCA market proxy → regime detection
+        # PCA loadings cached internally, refit every 6h (not every cycle)
+        price_matrix = self._build_price_matrix()
         pc1_series = None
-        pc1_returns = None
-        pc1_var = 0.0
+        if price_matrix is not None:
+            pc1_result = self.regime.compute_pc1_market_proxy(price_matrix)
+            pc1_series = pc1_result[0]
+            if pc1_result[2] > 0:
+                market_feats["pc1_explained_var"] = pc1_result[2]
 
-        if len(close_series) >= 2:
-            min_len = min(len(x) for x in close_series)
-            close_series = [x[-min_len:] for x in close_series]
-            price_matrix = np.column_stack(close_series)
+        # Update regime: rules + PCA-HMM
+        self.regime.update(market_feats, pc1_series)
 
-            pc1_series, pc1_returns, pc1_var = self.regime.compute_pc1_market_proxy(price_matrix)
-            market_feats["pc1_explained_var"] = pc1_var
-
-        # Update regime using PCA market proxy instead of BTC
-        if pc1_series is not None and len(pc1_series) > 100:
-            self.regime.update(market_feats, pc1_series)
-            if self.cycle_count % self.regime_refit_interval == 0:
-                self.regime.fit_hmm(pc1_series)
-        else:
-            # fallback if PCA cannot be built
-            log.warning("PCA market proxy unavailable; skipping regime HMM update this cycle")
+        # Refit HMM on PC1 every 24h (heavy operation)
+        if self.cycle_count % self.regime_refit_interval == 0 and pc1_series is not None:
+            self.regime.fit_hmm(pc1_series)
 
         self.risk_mgr.set_regime_multiplier(self.regime.get_exposure_multiplier())
-
-        # Sentiment
-        # if self.cycle_count % 12 == 1:
-        #     self.sentiment.update_fear_greed()
-
-        # # Optional: keep BTC context only for sentiment overlay, not regime
-        # btc_closes = self.binance.get_closes("BTC/USD")
-        # self.sentiment.update_btc_context(btc_closes.tolist() if len(btc_closes) > 0 else [])
-        # self.risk_mgr.set_sentiment_multiplier(self.sentiment.get_fg_exposure_multiplier())
 
         # Derivatives (every N cycles)
         if self.cycle_count % self.deriv_update_interval == 0:

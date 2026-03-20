@@ -87,7 +87,7 @@ class BinanceData:
         """
         pairs = pairs or TRADEABLE_COINS
         for pair in pairs:
-            candles = self.fetch_klines(pair, interval="5m", limit=3)
+            candles = self.fetch_klines(pair, interval="1h", limit=3)
             if not candles:
                 continue
 

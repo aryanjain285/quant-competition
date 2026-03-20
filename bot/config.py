@@ -27,7 +27,7 @@ BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
 BINANCE_FUTURES_URL = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com")
 
 # --- Timing ---
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL", "300"))  # 5 minutes
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL", "3600"))  # 1 hour — matches 1h candle data
 LIMIT_ORDER_TIMEOUT_SECONDS = 90
 
 # --- Signal Parameters ---
