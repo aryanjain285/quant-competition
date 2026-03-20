@@ -138,10 +138,12 @@ class RegimeDetector:
         else:
             # Fast projection using cached loadings (just a dot product)
             std = self._pca_std.copy()
-            std[std == 0] = 1.0  # prevent division by zero
-            returns_z = (returns - self._pca_mean) / std
-            returns_z = np.nan_to_num(returns_z, nan=0.0, posinf=0.0, neginf=0.0)
-            pc1_scores = returns_z @ self._pca_loadings
+            std[std == 0] = 1.0
+            with np.errstate(all='ignore'):
+                returns_z = (returns - self._pca_mean) / std
+                returns_z = np.nan_to_num(returns_z, nan=0.0, posinf=0.0, neginf=0.0)
+                pc1_scores = returns_z @ self._pca_loadings
+            pc1_scores = np.nan_to_num(pc1_scores, nan=0.0, posinf=0.0, neginf=0.0)
             loadings = self._pca_loadings
             explained_var = self._pca_explained_var
 
@@ -162,16 +164,19 @@ class RegimeDetector:
         downside_norm = min(1.0, downside / 0.5) if downside > 0 else 0
         cost_norm = min(1.0, cost / 0.001) if cost > 0 else 0
 
+        # Regime score: breadth and trend push positive, stress pushes negative.
+        # Reduced stress penalties — previous weights made neutral markets HOSTILE.
+        # breadth=0.5, trend=0 should be SELECTIVE, not HOSTILE.
         score = (
             (breadth - 0.5) * 2.0
             + np.clip(trend * 20, -1, 1)
-            - downside_norm * 0.5
-            - cost_norm * 0.3
+            - downside_norm * 0.3   # reduced from 0.5 — was too harsh
+            - cost_norm * 0.15      # reduced from 0.3
         )
 
-        if score > 0.3:
+        if score > 0.2:
             return TREND_SUPPORTIVE
-        elif score < -0.3:
+        elif score < -0.5:
             return HOSTILE
         else:
             return SELECTIVE

@@ -97,7 +97,10 @@ class TradingBot:
             log.error("Cannot fetch balance!")
             sys.exit(1)
 
-        ticker_data = self.client.ticker() or {}
+        ticker_data = self.client.ticker()
+        if ticker_data is None:
+            log.error("Cannot fetch ticker at init — portfolio value would be wrong!")
+            sys.exit(1)
         initial_value = self._compute_portfolio_value(wallet, ticker_data)
         log.info(f"Initial portfolio value: ${initial_value:,.2f}")
 
@@ -120,8 +123,8 @@ class TradingBot:
         self._sync_positions_from_wallet(wallet)
 
         self.cycle_count = 0
-        self.deriv_update_interval = 6    # every 30 min
-        self.regime_refit_interval = 288  # every 24h
+        self.deriv_update_interval = 6    # every 6 cycles = 6 hours (1h per cycle)
+        self.regime_refit_interval = 24   # every 24 cycles = 24 hours
 
     # ─── Helpers ────────────────────────────────────────────────
 
@@ -453,13 +456,14 @@ class TradingBot:
                          f"{'MARKET' if urgent else 'LIMIT'}")
                 self.executor.sell(pair, qty, price, bid, ask, use_limit=not urgent)
                 self.risk_mgr.clear_trailing_stop(pair)
+                self.positions[pair] = 0  # prevent double-sell with trailing stops
 
         # ══════════════════════════════════════════════════════
         # LOGGING
         # ══════════════════════════════════════════════════════
         self._log_cycle(ticker_data, portfolio_value, all_raw_features, signals, dd_check)
 
-        if self.cycle_count % 12 == 0:
+        if self.cycle_count % 1 == 0:  # every cycle = every hour
             metrics = self.perf.summary()
             log.info(
                 f"HOURLY | Ret: {metrics['total_return_pct']:.2f}% | "

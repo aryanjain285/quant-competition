@@ -224,12 +224,14 @@ class RiskManager:
 
         # ── Mean reversion: tight stops + profit target (full exits) ──
         if strategy == "mean_rev":
-            if drop_from_high >= 0.02:
-                log.info(f"TRAILING STOP [mean_rev]: {pair} -{drop_from_high:.2%} from high")
-                return True, "trailing_stop", 1.0
+            # Hard stop first (most important — cap losses)
             if pnl_from_entry <= -0.03:
                 log.info(f"HARD STOP [mean_rev]: {pair} {pnl_from_entry:.2%} from entry")
                 return True, "hard_stop", 1.0
+            # Trailing only when in profit (don't trail below entry)
+            if drop_from_high >= 0.02 and pnl_from_entry > 0:
+                log.info(f"TRAILING STOP [mean_rev]: {pair} -{drop_from_high:.2%} from high")
+                return True, "trailing_stop", 1.0
             if pnl_from_entry >= 0.03:
                 log.info(f"PROFIT TARGET [mean_rev]: {pair} +{pnl_from_entry:.2%}")
                 return True, "profit_target", 1.0

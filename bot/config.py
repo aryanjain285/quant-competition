@@ -2,12 +2,12 @@
 Configuration for the trading bot.
 All tunable parameters in one place. Override via environment variables.
 
-API keys must be set via environment variables or a .env file.
-NEVER hardcode keys here — they will leak into git history.
+ALL LOOKBACKS AND WINDOWS ARE IN 1-HOUR BARS.
+The bot fetches 1h candles from Binance. Every bar = 1 hour.
 """
 import os
 
-# Load .env file if present (keeps keys out of source code)
+# Load .env file if present
 _env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
 if os.path.exists(_env_path):
     with open(_env_path) as f:
@@ -22,22 +22,23 @@ API_KEY = os.getenv("ROOSTOO_API_KEY", "")
 API_SECRET = os.getenv("ROOSTOO_API_SECRET", "")
 BASE_URL = os.getenv("ROOSTOO_BASE_URL", "https://mock-api.roostoo.com")
 
-# --- Binance (public, no auth needed) ---
+# --- Binance ---
 BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
 BINANCE_FUTURES_URL = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com")
 
-# --- Timing ---
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL", "3600"))  # 1 hour — matches 1h candle data
+# --- Timing (1h bars → 1h cycle) ---
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL", "3600"))  # 1 hour
 LIMIT_ORDER_TIMEOUT_SECONDS = 90
 
-# --- Signal Parameters ---
-EMA_FAST = 21
-EMA_SLOW = 55
+# --- Signal Parameters (ALL IN 1-HOUR BARS) ---
+EMA_FAST = 21    # 21-hour EMA
+EMA_SLOW = 55    # 55-hour EMA
+
 MOMENTUM_LOOKBACKS = {
-    "1h": 12,    # 12 x 5min = 1 hour
-    "6h": 72,    # 72 x 5min = 6 hours
-    "24h": 288,  # 288 x 5min = 24 hours
-    "3d": 864,   # 864 x 5min = 3 days
+    "1h": 1,      # 1 bar  = 1 hour
+    "6h": 6,      # 6 bars = 6 hours
+    "24h": 24,    # 24 bars = 24 hours (1 day)
+    "3d": 72,     # 72 bars = 72 hours (3 days)
 }
 MOMENTUM_WEIGHTS = {
     "1h": 0.15,
@@ -46,43 +47,33 @@ MOMENTUM_WEIGHTS = {
     "3d": 0.25,
 }
 
-# --- Signal Parameters (v3) ---
-BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "864"))  # 72h in 5-min bars
+BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "72"))  # 72 bars = 72 hours = 3 days
 
-# RSI mean reversion (tightened in v3)
-RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "25"))      # was 30 — fewer, better entries
-RSI_OVERBOUGHT = float(os.getenv("RSI_OVERBOUGHT", "65"))
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+# --- Volatility (1h bars) ---
+VOL_LOOKBACK = 24              # 24 bars = 24 hours for realized vol
+VOL_LONG_LOOKBACK = 168        # 168 bars = 7 days for regime baseline
+ANNUALIZATION_FACTOR = 93.6    # sqrt(24 * 365) = sqrt(8760) for 1h bars
 
 # --- Risk Management ---
-# v3 COMPETITION TUNING: this is a mock portfolio with zero real downside.
-# Institutional-level conservatism (v1: 60% max, 8 pos, 1.5% risk) left
-# too much capital idle. Competition rewards being in the market.
-MAX_POSITION_PCT = 0.15          # 15% per coin (was 20% — more positions, less concentration)
-MAX_TOTAL_EXPOSURE_PCT = 0.80    # 80% invested (was 60% — deploy more capital)
-TARGET_RISK_PER_TRADE = 0.025    # 2.5% risk per trade (was 1.5% — bigger bets)
-MAX_POSITIONS = 12               # 12 positions (was 8 — more diversification)
+# Position sizing: vol-parity should be the binding constraint, not the cap.
+# With TARGET_RISK=0.005 and BTC vol=0.4: size = 0.005*1M / (0.4/19.1) = $238K
+# With DOGE vol=0.8: size = 0.005*1M / (0.8/19.1) = $119K
+# Cap at 15% = $150K only binds for very low vol coins. Vol-parity drives sizing.
+MAX_POSITION_PCT = 0.15
+MAX_TOTAL_EXPOSURE_PCT = 0.80
+TARGET_RISK_PER_TRADE = 0.005    # was 0.025 — too high, cap always bound, vol-parity was off
+MAX_POSITIONS = 12
 
-# Trailing stop
+# Trailing stops
 TRAILING_STOP_PCT = 0.03
-TRAILING_STOP_ATR_MULT = 2.0
+MEAN_REV_TAKE_PROFIT = 0.03    # +3% profit target for reversal trades
+MEAN_REV_STOP_LOSS = -0.03     # -3% hard stop for reversal trades
 
-# Drawdown circuit breakers (WIDENED for crypto volatility)
-# REDD handles smooth scaling; these are emergency-only.
-# v3: widened from 2%/4%/7% to avoid premature liquidation
-DRAWDOWN_LEVEL_1 = 0.035  # -3.5%: warning only (REDD already reducing sizing)
-DRAWDOWN_LEVEL_2 = 0.06   # -6%: liquidate + 4h pause (was 12h)
-DRAWDOWN_LEVEL_3 = 0.10   # -10%: liquidate + 12h pause (was 48h)
-
-DRAWDOWN_PAUSE_HOURS = {
-    1: 0,     # level 1: no pause, REDD handles it
-    2: 4,     # level 2: 4h pause (was 12h — too long, misses recovery)
-    3: 12,    # level 3: 12h pause (was 48h — risked failing 8-day activity rule)
-}
-
-# --- Volatility ---
-VOL_LOOKBACK_PERIODS = 288
-VOL_REGIME_BASELINE_PERIODS = 8640
+# Drawdown circuit breakers (REDD handles smooth scaling; these are emergency)
+DRAWDOWN_LEVEL_1 = 0.035
+DRAWDOWN_LEVEL_2 = 0.06
+DRAWDOWN_LEVEL_3 = 0.10
+DRAWDOWN_PAUSE_HOURS = {1: 0, 2: 4, 3: 12}
 
 # --- Execution ---
 USE_LIMIT_ORDERS = True
@@ -101,7 +92,6 @@ TRADEABLE_COINS = [
     "VIRTUAL/USD", "CAKE/USD", "PAXG/USD",
 ]
 
-# Map Roostoo pair -> Binance symbol
 BINANCE_SYMBOL_MAP = {
     "BTC/USD": "BTCUSDT", "ETH/USD": "ETHUSDT", "SOL/USD": "SOLUSDT",
     "BNB/USD": "BNBUSDT", "XRP/USD": "XRPUSDT", "DOGE/USD": "DOGEUSDT",

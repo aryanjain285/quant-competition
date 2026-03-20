@@ -86,8 +86,9 @@ class Executor:
             )
             if result and result.get("Success"):
                 detail = result.get("OrderDetail", {})
-                if detail.get("Status") == "PENDING":
-                    self.pending_orders[detail["OrderID"]] = {
+                order_id = detail.get("OrderID")
+                if detail.get("Status") == "PENDING" and order_id is not None:
+                    self.pending_orders[order_id] = {
                         "pair": pair, "side": "BUY",
                         "time_placed": time.time(),
                         "price": limit_price, "quantity": coin_qty,
@@ -144,8 +145,9 @@ class Executor:
             )
             if result and result.get("Success"):
                 detail = result.get("OrderDetail", {})
-                if detail.get("Status") == "PENDING":
-                    self.pending_orders[detail["OrderID"]] = {
+                order_id = detail.get("OrderID")
+                if detail.get("Status") == "PENDING" and order_id is not None:
+                    self.pending_orders[order_id] = {
                         "pair": pair, "side": "SELL",
                         "time_placed": time.time(),
                         "price": limit_price, "quantity": coin_quantity,

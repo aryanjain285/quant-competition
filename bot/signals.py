@@ -22,9 +22,6 @@ for continuation (proven in v3 backtest: single biggest improvement).
 Pure functions — same code runs in backtest and live.
 """
 import numpy as np
-from bot.features import (
-    compute_coin_features, zscore_universe, compute_submodel_scores,
-)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -141,7 +138,7 @@ def check_breakdown(closes: np.ndarray, lows: np.ndarray, lookback: int = 72) ->
     """Check if price has broken below recent low (exit signal)."""
     if len(closes) < lookback + 1:
         return False
-    breakdown_lb = max(lookback // 3, 12)
+    breakdown_lb = max(lookback // 3, 6)  # min 6h on 1h bars (was 12 = 12h)
     if len(lows) >= breakdown_lb + 1:
         prior_low = np.min(lows[-breakdown_lb - 1:-1])
     else:

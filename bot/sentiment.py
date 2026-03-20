@@ -91,27 +91,27 @@ class SentimentAnalyzer:
         """Update BTC lead-lag analysis from recent BTC prices.
 
         Args:
-            btc_closes: recent BTC close prices (1 hour candles), newest last.
-                        Need at least 12 for 12h return.
+            btc_closes: recent BTC close prices (1h candles), newest last.
+                        Need at least 3 for 1h return + recent bars.
         """
-        if len(btc_closes) < 13:
+        if len(btc_closes) < 3:
             return
 
-        # 12 hour return
-        self.btc_1h_return = (btc_closes[-1] / btc_closes[-13]) - 1
+        # 1-hour return (1 bar back on 1h data)
+        self.btc_1h_return = (btc_closes[-1] / btc_closes[-2]) - 1
 
-        # Recent per-bar returns (last 6 bars =  6 hours)
+        # Recent per-bar returns (last 6 bars = 6 hours)
         self.btc_recent_returns = []
-        for i in range(-6, 0):
+        for i in range(-min(6, len(btc_closes) - 1), 0):
             if abs(i) < len(btc_closes):
                 r = (btc_closes[i] / btc_closes[i - 1]) - 1
                 self.btc_recent_returns.append(r)
 
-        # BTC crash filter: if BTC dropped >1.5% in last 12 hours, pause altcoin buys
+        # BTC crash filter: if BTC dropped >1.5% in last 1 hour, pause altcoin buys
         if self.btc_1h_return < -0.015:
-            # Skip buys for 15 minutes (3 x 5-min cycles)
-            self.skip_buys_until = time.time() + 900
-            log.warning(f"BTC CRASH FILTER: BTC 1h return={self.btc_1h_return:.2%}, pausing altcoin buys 15min")
+            # Skip buys for 2 hours (2 x 1h cycles)
+            self.skip_buys_until = time.time() + 7200
+            log.warning(f"BTC CRASH FILTER: BTC 1h return={self.btc_1h_return:.2%}, pausing altcoin buys 2h")
 
         # BTC momentum boost: if BTC up >2% in last hour with acceleration
         self.btc_momentum_boost = 0.0

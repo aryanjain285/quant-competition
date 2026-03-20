@@ -38,8 +38,8 @@ class PerformanceTracker:
             if len(self.values) < 2:
                 return np.array([])
             vals = np.array([v for _, v in self.values])
-            # Sample every ~288 points (one day of 5-min bars)
-            step = max(1, len(vals) // max(1, len(vals) // 288))
+            # Sample every ~24 points (one day of 1h bars)
+            step = max(1, len(vals) // max(1, len(vals) // 24))
             sampled = vals[::step]
             if len(sampled) < 2:
                 return np.array([])

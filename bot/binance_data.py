@@ -52,6 +52,10 @@ class BinanceData:
             log.error(f"klines failed for {pair} ({symbol}): {e}")
             return None
 
+        if not isinstance(raw, list):
+            log.error(f"klines returned non-list for {pair}: {str(raw)[:100]}")
+            return None
+
         candles = []
         for k in raw:
             candles.append({
