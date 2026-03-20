@@ -350,311 +350,233 @@ class SimExecutor:
 
 
 class HistoricalMainLikeBacktest:
-    def __init__(self, all_candles: dict[str, list[dict]], exchange_info: dict[str, dict], spread_bps: float = DEFAULT_SPREAD_BPS):
+    def __init__(self, all_candles: dict[str, list[dict]], exchange_info: dict):
         self.all_candles = all_candles
-        self.exchange_info = exchange_info
-        self.spread_bps = spread_bps
-        self.active_pairs = [p for p in TRADEABLE_COINS if p in all_candles and p in exchange_info]
-
-    @staticmethod
-    def _build_store_slice(all_candles: dict[str, list[dict]], end_index_inclusive: int) -> dict[str, list[dict]]:
-        return {p: candles[: end_index_inclusive + 1] for p, candles in all_candles.items() if len(candles) > end_index_inclusive}
-
-    def _build_price_matrix(self, binance: BinanceData, pairs: list[str], min_bars: int = 100) -> Optional[np.ndarray]:
+        # FIX: Directly use exchange_info (no "TradePairs" wrapper in this script)
+        self.trade_pairs = exchange_info 
+        self.active_pairs = [p for p in TRADEABLE_COINS if p in self.trade_pairs and p in self.all_candles]
+        
+    def _build_price_matrix(self, t: int, min_bars: int = 100) -> Optional[np.ndarray]:
         close_series = []
-        for pair in pairs:
-            closes = binance.get_closes(pair)
-            if closes is None or len(closes) < min_bars:
+        for pair in self.active_pairs:
+            # FIX: Use "close" instead of "c"
+            closes = [c["close"] for c in self.all_candles[pair][:t+1]]
+            if len(closes) < min_bars:
                 continue
-            arr = np.asarray(closes, dtype=float)
-            if np.any(~np.isfinite(arr)):
-                continue
-            close_series.append(arr)
+            close_series.append(np.array(closes, dtype=float))
         if len(close_series) < 2:
             return None
         min_len = min(len(x) for x in close_series)
         return np.column_stack([x[-min_len:] for x in close_series])
 
-    def _compute_portfolio_value(self, client: SimRoostooClient, ticker_data: dict) -> float:
-        wallet = client.balance()
-        value = wallet.get("USD", {}).get("Free", 0.0) + wallet.get("USD", {}).get("Lock", 0.0)
-        for coin, bal in wallet.items():
-            if coin == "USD":
-                continue
-            total = bal.get("Free", 0.0) + bal.get("Lock", 0.0)
-            pair = f"{coin}/USD"
-            if total > 0 and pair in ticker_data:
-                value += total * ticker_data[pair].get("LastPrice", 0.0)
-        return value
+    def run_window(self, start_idx: int, end_idx: int) -> dict:
+        """Runs the exact 5-step Lean v4 pipeline over a historical window."""
+        
+        # 1. Initialize live modules
+        from bot.regime_detector import RegimeDetector
+        from bot.ranking import Ranker
+        from bot.risk_manager import RiskManager
+        from bot.metrics import PerformanceTracker
+        from bot.features import compute_coin_features, zscore_universe, compute_submodel_scores
+        from bot.signals import compute_signal
 
-    def _get_total_exposure_usd(self, positions: dict[str, float], ticker_data: dict) -> float:
-        exposure = 0.0
-        for pair, qty in positions.items():
-            if qty > 0 and pair in ticker_data:
-                exposure += qty * ticker_data[pair].get("LastPrice", 0.0)
-        return exposure
-
-    def run_window(self, start: int, end: int) -> dict:
-        # Historical clock / monkeypatch for time-dependent live modules.
-        clock = SimClock()
-        risk_manager_module.time.time = clock.time
-        executor_module.time.time = clock.time
-
-        # Seed history up to the start bar, matching main.py's startup model.
-        seed_store = self._build_store_slice(self.all_candles, start)
-        binance = BinanceData()
-        binance.candles = {p: list(v) for p, v in seed_store.items()}
-
-        client = SimRoostooClient(self.all_candles, self.exchange_info, clock, spread_bps=self.spread_bps)
-        executor = SimExecutor(client, self.exchange_info)
         regime = RegimeDetector()
         ranker = Ranker()
         risk_mgr = RiskManager(INITIAL_CASH)
         perf = PerformanceTracker(INITIAL_CASH)
-        positions: dict[str, float] = {}
+        
+        # Initialize Simulated Clock and sync global time
+        clock = SimClock()
+        pytime.time = clock.time
+        
+        # Client takes: all_candles, exchange_info, clock
+        client = SimRoostooClient(self.all_candles, self.trade_pairs, clock)
+        executor = SimExecutor(client, self.trade_pairs)
+
+        positions = {}
+        trade_log = []
         cycle_count = 0
-        regime_refit_interval = 24
-        trade_log: list[dict] = []
-
-        # Startup PCA/HMM fit, same spirit as load_historical_data().
-        initial_pm = self._build_price_matrix(binance, self.active_pairs)
-        if initial_pm is not None:
-            pc1_series, _, _, _ = regime.compute_pc1_market_proxy(initial_pm)
-            if pc1_series is not None and len(pc1_series) > 100:
-                regime.fit_hmm(pc1_series)
-
-        def sync_positions_from_wallet(wallet: dict):
-            positions.clear()
-            for coin, bal in wallet.items():
-                if coin == "USD":
-                    continue
-                free = bal.get("Free", 0.0)
-                if free > 0:
-                    pair = f"{coin}/USD"
-                    if pair in self.active_pairs:
-                        positions[pair] = free
-
-        def check_exits(ticker_data: dict, dd_check: dict):
-            for pair, qty in list(positions.items()):
-                if qty <= 0:
-                    continue
-                tick = ticker_data.get(pair, {})
-                price = tick.get("LastPrice", 0.0)
-                if price <= 0:
-                    continue
-                risk_mgr.update_trailing_stop(pair, price)
-                should_exit, reason, exit_fraction = risk_mgr.check_trailing_stop(pair, price)
-                if should_exit:
-                    sell_qty = qty * exit_fraction
-                    bid = tick.get("MaxBid", 0.0)
-                    ask = tick.get("MinAsk", 0.0)
-                    urgent = reason in ("hard_stop",)
-                    result = executor.sell(pair, sell_qty, price, bid, ask, use_limit=not urgent)
-                    filled_qty = (result or {}).get("OrderDetail", {}).get("FilledQuantity", 0.0)
-                    fill_price = (result or {}).get("OrderDetail", {}).get("FilledAverPrice", 0.0)
-                    trade_log.append({
-                        "bar": clock.ctx.current_index,
-                        "pair": pair,
-                        "side": "SELL",
-                        "qty": filled_qty,
-                        "price": fill_price,
-                        "reason": reason,
-                    })
-                    if exit_fraction >= 1.0:
-                        risk_mgr.clear_trailing_stop(pair)
-                        positions[pair] = max(0.0, positions.get(pair, 0.0) - filled_qty)
-                    else:
-                        positions[pair] = max(0.0, qty - filled_qty)
-
-        def liquidate_all(ticker_data: dict):
-            for pair, qty in list(positions.items()):
-                if qty <= 0:
-                    continue
-                tick = ticker_data.get(pair, {})
-                price = tick.get("LastPrice", 0.0)
-                bid = tick.get("MaxBid", 0.0)
-                ask = tick.get("MinAsk", 0.0)
-                result = executor.sell(pair, qty, price, bid, ask, use_limit=False)
-                filled_qty = (result or {}).get("OrderDetail", {}).get("FilledQuantity", 0.0)
-                fill_price = (result or {}).get("OrderDetail", {}).get("FilledAverPrice", 0.0)
-                trade_log.append({
-                    "bar": clock.ctx.current_index,
-                    "pair": pair,
-                    "side": "SELL",
-                    "qty": filled_qty,
-                    "price": fill_price,
-                    "reason": "liquidate_all",
-                })
-            positions.clear()
-
-        # Main replay loop. Each bar is one run_cycle().
-        for idx in range(start, end):
-            # Advance historical slice so current bar is visible to the strategy, same as update_latest() before feature calc.
-            for pair in self.active_pairs:
-                binance.candles[pair] = self.all_candles[pair][: idx + 1]
-
-            clock.set_bar(idx, self.all_candles[self.active_pairs[0]][idx]["close_time"])
+        
+        for t in range(start_idx, end_idx):
             cycle_count += 1
+            
+            # Sync the simulated clock to the actual Binance candle timestamp
+            first_pair = self.active_pairs[0]
+            current_ts_ms = self.all_candles[first_pair][t]["close_time"]
+            clock.set_bar(t, current_ts_ms)
 
+            # ══════════════════════════════════════════════════════
+            # STEP 0: Fetch Data & Check Breakers
+            # ══════════════════════════════════════════════════════
             ticker_data = client.ticker()
             wallet = client.balance()
-            sync_positions_from_wallet(wallet)
+            
+            # Sync positions
+            positions.clear()
+            for coin, bal in wallet.items():
+                if coin == "USD": continue
+                free = bal.get("Free", 0)
+                if free > 0:
+                    pair = f"{coin}/USD"
+                    positions[pair] = free
 
-            portfolio_value = self._compute_portfolio_value(client, ticker_data)
-            risk_mgr.update_portfolio_value(portfolio_value)
-            perf.record(portfolio_value, timestamp=clock.time())
+            # Portfolio Value & DD Breakers
+            port_value = wallet.get("USD", {}).get("Free", 0)
+            for pair, qty in positions.items():
+                port_value += qty * ticker_data.get(pair, {}).get("LastPrice", 0)
+                
+            risk_mgr.update_portfolio_value(port_value)
+            perf.record(port_value)
 
             dd_check = risk_mgr.check_drawdown_breakers()
             if dd_check["action"] == "liquidate":
-                liquidate_all(ticker_data)
+                for pair, qty in list(positions.items()):
+                    tick = ticker_data.get(pair, {})
+                    executor.sell(pair, qty, tick.get("LastPrice",0), tick.get("MaxBid",0), tick.get("MinAsk",0), use_limit=False)
+                    trade_log.append({"pair": pair, "reason": "dd_breaker"})
+                positions.clear()
                 executor.cancel_all_pending()
                 continue
+
             if risk_mgr.is_paused:
                 continue
 
+            # ══════════════════════════════════════════════════════
+            # STEP 1: REGIME FILTER (PCA-HMM Only)
+            # ══════════════════════════════════════════════════════
             all_raw_features = {}
             for pair in self.active_pairs:
-                closes = binance.get_closes(pair)
-                highs = binance.get_highs(pair)
-                lows = binance.get_lows(pair)
-                volumes = binance.get_volumes(pair)
+                hist = self.all_candles[pair][:t+1]
+                # FIX: Use explicit key names "close", "high", "low", "volume"
+                closes = np.array([x["close"] for x in hist])
                 if len(closes) < 100:
                     continue
+                highs = np.array([x["high"] for x in hist])
+                lows = np.array([x["low"] for x in hist])
+                volumes = np.array([x["volume"] for x in hist])
                 tick = ticker_data.get(pair, {})
-                bid = tick.get("MaxBid", 0.0)
-                ask = tick.get("MinAsk", 0.0)
-                feats = compute_coin_features(closes, highs, lows, volumes, bid, ask)
+                
+                feats = compute_coin_features(closes, highs, lows, volumes, tick.get("MaxBid",0), tick.get("MinAsk",0))
                 if feats:
                     all_raw_features[pair] = feats
 
-            price_matrix = self._build_price_matrix(binance, self.active_pairs)
+            # PCA market proxy
+            price_matrix = self._build_price_matrix(t)
             pc1_series = None
             if price_matrix is not None:
-                pc1_series = regime.compute_pc1_market_proxy(price_matrix)[0]
+                pc1_result = regime.compute_pc1_market_proxy(price_matrix)
+                pc1_series = pc1_result[0]
+
+            # Update regime (Only accepts pc1_series now!)
             regime.update(pc1_series=pc1_series)
-            if cycle_count % regime_refit_interval == 0 and pc1_series is not None:
+
+            if cycle_count % 24 == 0 and pc1_series is not None:
                 regime.fit_hmm(pc1_series)
 
             risk_mgr.set_regime_multiplier(regime.get_exposure_multiplier())
             executor.manage_pending_orders()
-            sync_positions_from_wallet(client.balance())
 
             if not regime.should_trade():
-                check_exits(ticker_data, dd_check)
+                # Just check exits and skip
+                for pair, qty in list(positions.items()):
+                    tick = ticker_data.get(pair, {})
+                    price = tick.get("LastPrice", 0)
+                    risk_mgr.update_trailing_stop(pair, price)
+                    should_exit, reason, exit_frac = risk_mgr.check_trailing_stop(pair, price)
+                    if should_exit:
+                        executor.sell(pair, qty * exit_frac, price, tick.get("MaxBid",0), tick.get("MinAsk",0), use_limit=False)
+                        if exit_frac >= 1.0: risk_mgr.clear_trailing_stop(pair)
+                        trade_log.append({"pair": pair, "reason": reason})
                 continue
 
+            # ══════════════════════════════════════════════════════
+            # STEP 2: EVENT FILTER (No Derivatives)
+            # ══════════════════════════════════════════════════════
             all_zscored = zscore_universe(all_raw_features)
             for pair in all_zscored:
                 compute_submodel_scores(all_zscored[pair])
 
             signals = {}
             for pair in all_raw_features:
-                closes = binance.get_closes(pair)
-                lows = binance.get_lows(pair)
+                hist = self.all_candles[pair][:t+1]
+                closes = np.array([x["close"] for x in hist])
+                lows = np.array([x["low"] for x in hist])
                 signals[pair] = compute_signal(all_raw_features[pair], all_zscored[pair], closes, lows, BREAKOUT_LOOKBACK)
 
+            # ══════════════════════════════════════════════════════
+            # STEP 3 & 4: VALID TRADES & RANKING
+            # ══════════════════════════════════════════════════════
             valid_candidates = {}
             for pair, sig in signals.items():
-                if sig["action"] == "BUY" and positions.get(pair, 0.0) <= 0:
-                    valid_candidates[pair] = dict(all_zscored.get(pair, {}))
+                if sig["action"] == "BUY" and positions.get(pair, 0) <= 0:
+                    valid_candidates[pair] = all_zscored.get(pair, {})
                     valid_candidates[pair]["_signal"] = sig
 
-            if not valid_candidates:
-                check_exits(ticker_data, dd_check)
-            else:
-                ranked = ranker.rank(valid_candidates, max_results=MAX_POSITIONS)
-                check_exits(ticker_data, dd_check)
+            ranked = ranker.rank(valid_candidates, max_results=MAX_POSITIONS)
 
-                total_exposure = self._get_total_exposure_usd(positions, ticker_data)
-                num_positions = sum(1 for q in positions.values() if q > 0)
+            # ══════════════════════════════════════════════════════
+            # STEP 5: EXECUTION
+            # ══════════════════════════════════════════════════════
+            
+            # Check Exits First
+            for pair, qty in list(positions.items()):
+                tick = ticker_data.get(pair, {})
+                price = tick.get("LastPrice", 0)
+                risk_mgr.update_trailing_stop(pair, price)
+                should_exit, reason, exit_frac = risk_mgr.check_trailing_stop(pair, price)
+                if should_exit:
+                    executor.sell(pair, qty * exit_frac, price, tick.get("MaxBid",0), tick.get("MinAsk",0), use_limit=(reason != "hard_stop"))
+                    if exit_frac >= 1.0: risk_mgr.clear_trailing_stop(pair)
+                    trade_log.append({"pair": pair, "reason": reason})
 
-                for pair, score, features in ranked:
-                    if num_positions >= MAX_POSITIONS:
-                        break
-                    sig = features.get("_signal", {})
-                    tick = ticker_data.get(pair, {})
-                    price = tick.get("LastPrice", 0.0)
-                    bid = tick.get("MaxBid", 0.0)
-                    ask = tick.get("MinAsk", 0.0)
-                    if price <= 0:
-                        continue
-                    real_vol = all_raw_features.get(pair, {}).get("realized_vol", 0.5)
-                    size_usd = risk_mgr.position_size_usd(
-                        pair,
-                        real_vol,
-                        total_exposure,
-                        num_positions,
-                        signal_strength=sig.get("strength", 0.5),
-                    )
-                    if size_usd < 50:
-                        continue
+            total_exposure = sum(qty * ticker_data.get(p, {}).get("LastPrice", 0) for p, qty in positions.items())
+            num_positions = len(positions)
 
-                    result = executor.buy(pair, size_usd, price, bid, ask, use_limit=USE_LIMIT_ORDERS)
+            # Buys
+            for pair, score, features in ranked:
+                if num_positions >= MAX_POSITIONS: break
+                sig = features.get("_signal", {})
+                tick = ticker_data.get(pair, {})
+                price = tick.get("LastPrice", 0)
+                real_vol = all_raw_features.get(pair, {}).get("realized_vol", 0.5)
+
+                # Lean position sizer (no deriv_score)
+                size_usd = risk_mgr.position_size_usd(
+                    pair, real_vol, total_exposure, num_positions,
+                    signal_strength=sig.get("strength", 0.5)
+                )
+
+                if size_usd >= 50:
+                    result = executor.buy(pair, size_usd, price, tick.get("MaxBid",0), tick.get("MinAsk",0), use_limit=USE_LIMIT_ORDERS)
                     if result and result.get("Success"):
-                        detail = result.get("OrderDetail", {})
-                        filled_qty = detail.get("FilledQuantity", 0.0)
-                        if filled_qty > 0:
-                            positions[pair] = positions.get(pair, 0.0) + filled_qty
-                            strategy = sig.get("strategy", "continuation")
-                            risk_mgr.update_trailing_stop(
-                                pair,
-                                price,
-                                strategy="mean_rev" if strategy == "reversal" else "breakout",
-                                entry_price=detail.get("FilledAverPrice", price),
-                            )
-                            total_exposure += filled_qty * detail.get("FilledAverPrice", price)
-                            num_positions = sum(1 for q in positions.values() if q > 0)
-                            trade_log.append({
-                                "bar": idx,
-                                "pair": pair,
-                                "side": "BUY",
-                                "qty": filled_qty,
-                                "price": detail.get("FilledAverPrice", price),
-                                "reason": strategy,
-                                "rank_score": score,
-                            })
+                        strategy = sig.get("strategy", "continuation")
+                        risk_mgr.update_trailing_stop(
+                            pair, price, 
+                            strategy="mean_rev" if strategy == "reversal" else "breakout",
+                            entry_price=price
+                        )
+                        total_exposure += size_usd
+                        num_positions += 1
+                        trade_log.append({"pair": pair, "reason": "buy", "strategy": strategy})
 
-                for pair, sig in signals.items():
-                    if sig["action"] == "SELL" and positions.get(pair, 0.0) > 0:
-                        tick = ticker_data.get(pair, {})
-                        price = tick.get("LastPrice", 0.0)
-                        bid = tick.get("MaxBid", 0.0)
-                        ask = tick.get("MinAsk", 0.0)
-                        qty = positions[pair]
-                        urgent = sig.get("breakdown", False)
-                        result = executor.sell(pair, qty, price, bid, ask, use_limit=not urgent)
-                        filled_qty = (result or {}).get("OrderDetail", {}).get("FilledQuantity", 0.0)
-                        fill_price = (result or {}).get("OrderDetail", {}).get("FilledAverPrice", 0.0)
-                        risk_mgr.clear_trailing_stop(pair)
-                        positions[pair] = max(0.0, positions.get(pair, 0.0) - filled_qty)
-                        trade_log.append({
-                            "bar": idx,
-                            "pair": pair,
-                            "side": "SELL",
-                            "qty": filled_qty,
-                            "price": fill_price,
-                            "reason": "breakdown",
-                        })
+            # Signal Sells (Breakdowns)
+            for pair, sig in signals.items():
+                if sig["action"] == "SELL" and positions.get(pair, 0) > 0:
+                    qty = positions[pair]
+                    tick = ticker_data.get(pair, {})
+                    urgent = sig.get("breakdown", False)
+                    executor.sell(pair, qty, tick.get("LastPrice",0), tick.get("MaxBid",0), tick.get("MinAsk",0), use_limit=not urgent)
+                    risk_mgr.clear_trailing_stop(pair)
+                    trade_log.append({"pair": pair, "reason": "breakdown_signal"})
 
-            sync_positions_from_wallet(client.balance())
-
-        # Force close any remaining positions at the end of the window.
-        if end - 1 >= start:
-            clock.set_bar(end - 1, self.all_candles[self.active_pairs[0]][end - 1]["close_time"])
-            ticker_data = client.ticker()
-            liquidate_all(ticker_data)
-            perf.record(self._compute_portfolio_value(client, client.ticker()), timestamp=clock.time())
+        # End of window teardown (liquidate to get final cash value)
+        for pair, qty in list(client.positions.items()):
+            if qty > 0:
+                tick = client.ticker().get(pair, {})
+                executor.sell(pair, qty, tick.get("LastPrice", 0), tick.get("MaxBid", 0), tick.get("MinAsk", 0), use_limit=False)
 
         summary = perf.summary()
-        win_trades = sum(1 for tr in trade_log if tr["side"] == "SELL" and tr.get("price", 0) > 0)
-        return {
-            "summary": summary,
-            "trade_log": trade_log,
-            "final_cash": client.cash,
-            "positions": dict(client.positions),
-            "wins": win_trades,
-        }
-
+        return {"summary": summary, "trade_log": trade_log}
 
 def default_exchange_info(pairs: list[str]) -> dict[str, dict]:
     info = {}
