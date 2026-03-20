@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import numpy as np
 import requests
 from bot.backtest.data_loader import compute_metrics, print_metrics, CORE_PAIRS
-from bot.signals import compute_signal, ema
+from bot.signals import compute_signal
 from bot.config import (
     BINANCE_FUTURES_URL, BINANCE_SYMBOL_MAP,
     MAX_POSITIONS, MAX_TOTAL_EXPOSURE_PCT, MAX_POSITION_PCT,

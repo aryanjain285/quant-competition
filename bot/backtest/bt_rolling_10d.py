@@ -344,6 +344,7 @@ def main():
     pairs = list(data.keys())
     print(f"  Loaded {len(pairs)} pairs, {min_len} bars (~{min_len//24}d)")
 
+
     # Rolling 10-day windows
     window = 240   # 10 days × 24h
     step = 72      # 3-day step

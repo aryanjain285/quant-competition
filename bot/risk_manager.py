@@ -40,7 +40,6 @@ class RiskManager:
 
         # External multipliers (set by regime detector, sentiment, etc.)
         self.regime_exposure_mult: float = 1.0
-        self.sentiment_exposure_mult: float = 1.0
 
     def update_portfolio_value(self, value: float):
         self.current_value = value
@@ -51,9 +50,6 @@ class RiskManager:
         """Set by regime detector each cycle."""
         self.regime_exposure_mult = np.clip(mult, 0.1, 1.0)
 
-    def set_sentiment_multiplier(self, mult: float):
-        """Set by sentiment analyzer each cycle."""
-        self.sentiment_exposure_mult = np.clip(mult, 0.3, 1.0)
 
     @property
     def drawdown_from_peak(self) -> float:
@@ -122,7 +118,6 @@ class RiskManager:
         current_exposure_usd: float,
         num_current_positions: int,
         signal_strength: float = 1.0,
-        deriv_score: float = 0.0,
     ) -> float:
         """Calculate position size with REDD scaling and regime awareness.
 
@@ -145,7 +140,6 @@ class RiskManager:
         effective_exposure = (
             MAX_TOTAL_EXPOSURE_PCT
             * self.regime_exposure_mult
-            * self.sentiment_exposure_mult
         )
         remaining_exposure = (effective_exposure * portfolio) - current_exposure_usd
         if remaining_exposure <= 0:
@@ -168,10 +162,6 @@ class RiskManager:
 
         # REDD scaling: smoothly reduce as drawdown grows
         size *= self._redd_multiplier()
-
-        # Derivatives boost/penalty: ±20% max
-        deriv_adj = 1.0 + np.clip(deriv_score * 0.2, -0.2, 0.2)
-        size *= deriv_adj
 
         # Signal strength scaling
         size *= np.clip(signal_strength, 0.3, 1.0)
@@ -282,9 +272,8 @@ class RiskManager:
             "drawdown_level": self.drawdown_level,
             "redd_mult": round(self._redd_multiplier(), 3),
             "regime_mult": round(self.regime_exposure_mult, 3),
-            "sentiment_mult": round(self.sentiment_exposure_mult, 3),
             "effective_exposure": round(
-                MAX_TOTAL_EXPOSURE_PCT * self.regime_exposure_mult * self.sentiment_exposure_mult, 3
+                MAX_TOTAL_EXPOSURE_PCT * self.regime_exposure_mult, 3
             ),
             "is_paused": self.is_paused,
             "pause_remaining_min": max(0, round((self.pause_until - time.time()) / 60, 1)),
