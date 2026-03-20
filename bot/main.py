@@ -154,6 +154,47 @@ class TradingBot:
                 exposure += qty * ticker_data[pair].get("LastPrice", 0)
         return exposure
     
+    def _build_price_matrix(self, min_bars: int = 100):
+        """
+        Build a time x assets close-price matrix from currently loaded Binance history.
+
+        Returns:
+            price_matrix: np.ndarray of shape (time, assets) or None
+            valid_pairs: list[str]
+        """
+        close_series = []
+        valid_pairs = []
+
+        for pair in self.active_pairs:
+            closes = self.binance.get_closes(pair)
+            if closes is None:
+                continue
+            if len(closes) < min_bars:
+                continue
+
+            arr = np.asarray(closes, dtype=float)
+            if np.any(~np.isfinite(arr)):
+                continue
+
+            close_series.append(arr)
+            valid_pairs.append(pair)
+
+        if len(close_series) < 2:
+            log.warning("Price matrix build failed: fewer than 2 valid pairs with sufficient history")
+            return None, []
+
+        min_len = min(len(x) for x in close_series)
+        close_series = [x[-min_len:] for x in close_series]
+
+        price_matrix = np.column_stack(close_series)
+
+        log.info(
+            f"Built price matrix: shape={price_matrix.shape} "
+            f"(time={price_matrix.shape[0]}, assets={price_matrix.shape[1]}) "
+            f"from {len(valid_pairs)} pairs"
+        )
+
+        return price_matrix, valid_pairs
         
     # ─── Startup ────────────────────────────────────────────────
 
@@ -578,7 +619,9 @@ class TradingBot:
 
         while _running:
             try:
+                log.info(f"About to run cycle {self.cycle_count + 1}")
                 self.run_cycle()
+                log.info(f"Finished cycle {self.cycle_count}")
             except Exception as e:
                 log.error(f"Cycle error: {e}\n{traceback.format_exc()}")
 

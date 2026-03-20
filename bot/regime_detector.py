@@ -223,18 +223,35 @@ class RegimeDetector:
 
 
 # --- market proxy regime detectio using principal component analysis --- 
+
     def compute_pc1_market_proxy(self, price_matrix: np.ndarray):
         """
-        price_matrix shape: (time, assets)
-        returns:
-            synthetic_series: cumulative PC1 series for compatibility
-            pc1_scores: raw PC1 return-like factor scores
-            explained_var: variance explained by PC1
+        Compute PC1 market proxy from a price matrix.
+
+        Args:
+            price_matrix: np.ndarray, shape (time, assets)
+
+        Returns:
+            synthetic_series: np.ndarray, shape (time,)
+                Cumulative synthetic PC1 series for compatibility with fit_hmm(price_series)
+            pc1_scores: np.ndarray, shape (time-1,)
+                Raw PC1 factor scores computed from standardized returns
+            explained_var: float
+                Fraction of variance explained by PC1
+            loadings: np.ndarray, shape (assets,)
+                PC1 loadings across assets
         """
+        if price_matrix is None or price_matrix.ndim != 2:
+            raise ValueError("price_matrix must be a 2D array of shape (time, assets)")
+
+        if price_matrix.shape[0] < 3 or price_matrix.shape[1] < 2:
+            raise ValueError("price_matrix must have at least 3 rows and 2 columns")
+
+        # Log returns
         returns = np.log(price_matrix[1:] / price_matrix[:-1])
         returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Standardize each asset so high-vol names do not dominate
+        # Standardize each asset column so high-vol names do not dominate PC1
         mu = returns.mean(axis=0, keepdims=True)
         sigma = returns.std(axis=0, keepdims=True)
         sigma[sigma == 0] = 1.0
@@ -243,8 +260,14 @@ class RegimeDetector:
         pca = PCA(n_components=1)
         pc1_scores = pca.fit_transform(returns_z).flatten()
         explained_var = float(pca.explained_variance_ratio_[0])
+        loadings = pca.components_[0].copy()
 
-        # Compatibility hack for existing fit_hmm(closes)
+        # Sign convention: make average loading positive for consistency across runs
+        if loadings.mean() < 0:
+            pc1_scores = -pc1_scores
+            loadings = -loadings
+
+        # Compatibility series for existing fit_hmm(price_series)
         synthetic_series = np.exp(np.insert(np.cumsum(pc1_scores), 0, 0.0))
 
-        return synthetic_series, pc1_scores, explained_var
+        return synthetic_series, pc1_scores, explained_var, loadings
