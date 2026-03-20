@@ -106,7 +106,7 @@ class TradingBot:
 
         # ── Intelligence layers ──
         self.regime = RegimeDetector()
-        self.sentiment = SentimentAnalyzer()
+        # self.sentiment = SentimentAnalyzer()
         self.ranker = Ranker()
 
         # ── Risk & execution ──
@@ -153,8 +153,22 @@ class TradingBot:
             if qty > 0 and pair in ticker_data:
                 exposure += qty * ticker_data[pair].get("LastPrice", 0)
         return exposure
-
+    
+        
     # ─── Startup ────────────────────────────────────────────────
+
+    # def load_historical_data(self):
+    #     log.info("Loading historical data...")
+    #     self.binance.load_history(self.active_pairs, interval="5m", limit=1000)
+    #     log.info("Loading derivatives data...")
+    #     self.derivatives.load_all(self.active_pairs)
+
+    #     btc_closes = self.binance.get_closes("BTC/USD")
+    #     if len(btc_closes) > 100:
+    #         self.regime.fit_hmm(btc_closes)
+
+    #     self.sentiment.update_fear_greed()
+    #     log.info("All historical data loaded.")
 
     def load_historical_data(self):
         log.info("Loading historical data...")
@@ -177,12 +191,12 @@ class TradingBot:
             close_series = [x[-min_len:] for x in close_series]
             price_matrix = np.column_stack(close_series)
 
-            pc1_series, pc1_returns, pc1_var = compute_pc1_market_proxy(price_matrix)
+            pc1_series, pc1_returns, pc1_var = self.regime.compute_pc1_market_proxy(price_matrix)
 
             if len(pc1_series) > 100:
                 self.regime.fit_hmm(pc1_series)
 
-        self.sentiment.update_fear_greed()
+        # self.sentiment.update_fear_greed()
         log.info("All historical data loaded.")
 
     # ─── Main Cycle ─────────────────────────────────────────────
@@ -248,19 +262,58 @@ class TradingBot:
         # Market-level features for regime
         market_feats = compute_market_features(all_raw_features)
 
-        # Update regime (rules + HMM)
-        btc_closes = self.binance.get_closes("BTC/USD")
-        self.regime.update(market_feats, btc_closes)
-        if self.cycle_count % self.regime_refit_interval == 0:
-            self.regime.fit_hmm(btc_closes)
+        # # Update regime (rules + HMM)
+        # btc_closes = self.binance.get_closes("BTC/USD")
+        # self.regime.update(market_feats, btc_closes)
+        # if self.cycle_count % self.regime_refit_interval == 0:
+        #     self.regime.fit_hmm(btc_closes)
+
+        # self.risk_mgr.set_regime_multiplier(self.regime.get_exposure_multiplier())
+
+        # # Sentiment
+        # if self.cycle_count % 12 == 1:
+        #     self.sentiment.update_fear_greed()
+        # self.sentiment.update_btc_context(btc_closes.tolist() if len(btc_closes) > 0 else [])
+        # self.risk_mgr.set_sentiment_multiplier(self.sentiment.get_fg_exposure_multiplier())
+        
+        # Build rolling price matrix for PCA market proxy
+        close_series = []
+        for pair in self.active_pairs:
+            closes = self.binance.get_closes(pair)
+            if closes is not None and len(closes) >= 100:
+                close_series.append(np.array(closes, dtype=float))
+
+        pc1_series = None
+        pc1_returns = None
+        pc1_var = 0.0
+
+        if len(close_series) >= 2:
+            min_len = min(len(x) for x in close_series)
+            close_series = [x[-min_len:] for x in close_series]
+            price_matrix = np.column_stack(close_series)
+
+            pc1_series, pc1_returns, pc1_var = self.regime.compute_pc1_market_proxy(price_matrix)
+            market_feats["pc1_explained_var"] = pc1_var
+
+        # Update regime using PCA market proxy instead of BTC
+        if pc1_series is not None and len(pc1_series) > 100:
+            self.regime.update(market_feats, pc1_series)
+            if self.cycle_count % self.regime_refit_interval == 0:
+                self.regime.fit_hmm(pc1_series)
+        else:
+            # fallback if PCA cannot be built
+            log.warning("PCA market proxy unavailable; skipping regime HMM update this cycle")
 
         self.risk_mgr.set_regime_multiplier(self.regime.get_exposure_multiplier())
 
         # Sentiment
-        if self.cycle_count % 12 == 1:
-            self.sentiment.update_fear_greed()
-        self.sentiment.update_btc_context(btc_closes.tolist() if len(btc_closes) > 0 else [])
-        self.risk_mgr.set_sentiment_multiplier(self.sentiment.get_fg_exposure_multiplier())
+        # if self.cycle_count % 12 == 1:
+        #     self.sentiment.update_fear_greed()
+
+        # # Optional: keep BTC context only for sentiment overlay, not regime
+        # btc_closes = self.binance.get_closes("BTC/USD")
+        # self.sentiment.update_btc_context(btc_closes.tolist() if len(btc_closes) > 0 else [])
+        # self.risk_mgr.set_sentiment_multiplier(self.sentiment.get_fg_exposure_multiplier())
 
         # Derivatives (every N cycles)
         if self.cycle_count % self.deriv_update_interval == 0:
@@ -320,13 +373,13 @@ class TradingBot:
                         sig["strategy"] = "oi_divergence"
                         sig["strength"] = 0.7
 
-            # BTC crash filter
-            if sig["action"] == "BUY" and pair != "BTC/USD":
-                if self.sentiment.should_skip_altcoin_buys():
-                    sig["action"] = "HOLD"
-                    sig["strategy"] = "btc_crash_filter"
-                elif sig["strategy"] == "continuation":
-                    sig["strength"] = min(1.0, sig["strength"] + self.sentiment.get_btc_signal_boost())
+            # # BTC crash filter
+            # if sig["action"] == "BUY" and pair != "BTC/USD":
+            #     if self.sentiment.should_skip_altcoin_buys():
+            #         sig["action"] = "HOLD"
+            #         sig["strategy"] = "btc_crash_filter"
+            #     elif sig["strategy"] == "continuation":
+            #         sig["strength"] = min(1.0, sig["strength"] + self.sentiment.get_btc_signal_boost())
 
             sig["deriv_score"] = round(deriv_score, 3)
             sig["deriv_divergence"] = dsig.get("oi_price_divergence", False)
@@ -503,7 +556,7 @@ class TradingBot:
                 for p, s in signals.items() if s.get("action") != "HOLD"
             } if signals else {},
             "regime": self.regime.get_status(),
-            "sentiment": self.sentiment.get_status(),
+            #"sentiment": self.sentiment.get_status(),
             "risk": self.risk_mgr.get_status(),
             "drawdown_action": dd_check.get("action", "none"),
             "metrics": self.perf.summary(),

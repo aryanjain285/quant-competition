@@ -91,23 +91,23 @@ class SentimentAnalyzer:
         """Update BTC lead-lag analysis from recent BTC prices.
 
         Args:
-            btc_closes: recent BTC close prices (5-min candles), newest last.
-                        Need at least 12 for 1h return.
+            btc_closes: recent BTC close prices (1 hour candles), newest last.
+                        Need at least 12 for 12h return.
         """
         if len(btc_closes) < 13:
             return
 
-        # 1-hour return (last 12 x 5-min bars)
+        # 12 hour return
         self.btc_1h_return = (btc_closes[-1] / btc_closes[-13]) - 1
 
-        # Recent per-bar returns (last 6 bars = 30 min)
+        # Recent per-bar returns (last 6 bars =  6 hours)
         self.btc_recent_returns = []
         for i in range(-6, 0):
             if abs(i) < len(btc_closes):
                 r = (btc_closes[i] / btc_closes[i - 1]) - 1
                 self.btc_recent_returns.append(r)
 
-        # BTC crash filter: if BTC dropped >1.5% in last hour, pause altcoin buys
+        # BTC crash filter: if BTC dropped >1.5% in last 12 hours, pause altcoin buys
         if self.btc_1h_return < -0.015:
             # Skip buys for 15 minutes (3 x 5-min cycles)
             self.skip_buys_until = time.time() + 900
