@@ -32,6 +32,7 @@ import traceback
 import numpy as np
 from typing import Optional
 from datetime import datetime, timezone
+from sklearn.linear_model import Ridge
 
 from bot.config import (
     POLL_INTERVAL_SECONDS, TRADEABLE_COINS,
@@ -48,6 +49,7 @@ from bot.risk_manager import RiskManager
 from bot.executor import Executor
 from bot.metrics import PerformanceTracker
 from bot.logger import get_logger, log_cycle
+from bot.ml import RidgeTrainer
 
 log = get_logger("main")
 
@@ -173,6 +175,51 @@ class TradingBot:
 
         min_len = min(len(x) for x in close_series)
         return np.column_stack([x[-min_len:] for x in close_series])
+    
+    def _train_ridge_model(self, lookback_hours: int = 400, forward_horizon: int = 24):
+        """Trains Ridge regression targeting +24h returns using BinanceData."""
+        min_len = min((len(self.binance.get_closes(p)) for p in self.active_pairs), default=0)
+        if min_len < lookback_hours + forward_horizon + 100:
+            return  # Not enough data yet
+
+        log.info(f"Training Ridge ML Model (Lookback: {lookback_hours}h)...")
+        X_train, y_train = [], []
+        features_to_use = self.ranker.ridge_features
+
+        start_idx = min_len - lookback_hours - forward_horizon
+        end_idx = min_len - forward_horizon
+
+        for t in range(start_idx, end_idx, 6):  # Sample every 6h to reduce noise
+            raw_features = {}
+            for pair in self.active_pairs:
+                closes = self.binance.get_closes(pair)[:t+1]
+                if len(closes) < 100: continue
+                highs = self.binance.get_highs(pair)[:t+1]
+                lows = self.binance.get_lows(pair)[:t+1]
+                volumes = self.binance.get_volumes(pair)[:t+1]
+                
+                # Approximate bid/ask with close for historical training
+                curr_px = closes[-1]
+                feats = compute_coin_features(closes, highs, lows, volumes, curr_px, curr_px)
+                if feats:
+                    raw_features[pair] = feats
+
+            zscored = zscore_universe(raw_features)
+            
+            for pair, f_z in zscored.items():
+                curr_close = self.binance.get_closes(pair)[t]
+                future_close = self.binance.get_closes(pair)[t + forward_horizon]
+                target_return = (future_close - curr_close) / curr_close
+                
+                # Build X vector strictly based on ranking.py's expected keys
+                X_train.append([f_z.get(k, 0.0) for k in features_to_use])
+                y_train.append(target_return)
+
+        if len(X_train) > 50:
+            model = Ridge(alpha=1.0)
+            model.fit(X_train, y_train)
+            self.ranker.set_ridge_model(model)
+            log.info(f"Ridge model trained on {len(X_train)} samples & passed to Ranker.")
         
     # ─── Startup ────────────────────────────────────────────────
 
@@ -215,6 +262,17 @@ class TradingBot:
         portfolio_value = self._compute_portfolio_value(wallet, ticker_data)
         self.risk_mgr.update_portfolio_value(portfolio_value)
         self.perf.record(portfolio_value)
+
+        # ══════════════════════════════════════════════════════════════
+        # LIVE MACHINE LEARNING INJECTION
+        # Train the model every 6 hours (cycle 1, 7, 13...) to keep it fresh
+        # ══════════════════════════════════════════════════════════════
+        if self.cycle_count % 24 == 1:  # Train once a day
+            try:
+                self._train_ridge_model()
+            except Exception as e:
+                log.error(f"ML Training failed: {e}")
+        # ══════════════════════════════════════════════════════════════
 
         # Drawdown breakers (emergency only)
         dd_check = self.risk_mgr.check_drawdown_breakers()
