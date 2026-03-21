@@ -1,22 +1,9 @@
 """
-Market regime detector v4: rule-based + PCA-HMM ensemble.
+Market regime detector v4: PCA-HMM Only.
 
-Primary: rule-based regime score from cross-sectional market features
-  (breadth, trend strength, downside stress, cost stress).
-
-Secondary: HMM fitted on PC1 of cross-sectional returns (not raw BTC).
-  PC1 captures the dominant market factor — better than BTC alone because
-  it reflects the entire universe's co-movement.
-
-PCA performance optimization:
-  - Full PCA refit every 6 hours (expensive: SVD on T×N matrix)
-  - Between refits: project new returns onto cached loadings (cheap: dot product)
-  - HMM refit every 24 hours on the PC1 series
-
-Three regime states:
-  TREND_SUPPORTIVE → full exposure
-  SELECTIVE → reduced exposure
-  HOSTILE → minimal/no new longs
+- Full PCA refit every 6 hours (expensive: SVD on T×N matrix)
+- Between refits: project new returns onto cached loadings (cheap: dot product)
+- HMM refit every 24 hours on the PC1 series
 """
 import warnings
 import time as _time
@@ -51,16 +38,12 @@ EXPOSURE_MULTIPLIERS = {
     HOSTILE: 0.25,
 }
 
-
 class RegimeDetector:
-    """Detects market regime from cross-sectional features + PCA-HMM."""
+    """Detects market regime from PCA-HMM."""
 
     def __init__(self):
         self.current_regime = SELECTIVE
         self.regime_confidence = 0.5
-        self.rule_regime = SELECTIVE
-        self.hmm_regime = SELECTIVE
-        self.market_features = {}
 
         # HMM
         self.hmm_model: Optional[GaussianHMM] = None
@@ -68,28 +51,15 @@ class RegimeDetector:
         self._hmm_state_map = {}
 
         # PCA cache — avoid recomputing every cycle
-        self._pca_loadings: Optional[np.ndarray] = None  # shape (n_assets,)
-        self._pca_mean: Optional[np.ndarray] = None       # shape (n_assets,)
-        self._pca_std: Optional[np.ndarray] = None         # shape (n_assets,)
+        self._pca_loadings: Optional[np.ndarray] = None
+        self._pca_mean: Optional[np.ndarray] = None
+        self._pca_std: Optional[np.ndarray] = None
         self._pca_explained_var: float = 0.0
         self._pca_last_fit: float = 0.0
-        self._pca_refit_interval: float = 6 * 3600  # refit PCA every 6 hours
+        self._pca_refit_interval: float = 6 * 3600
         self._pc1_series: Optional[np.ndarray] = None
 
-    # ─── PCA Market Proxy ──────────────────────────────────────
-
     def compute_pc1_market_proxy(self, price_matrix: np.ndarray) -> tuple:
-        """Compute PC1 market proxy from cross-sectional price matrix.
-
-        Args:
-            price_matrix: shape (time, assets) — aligned close prices
-
-        Returns:
-            (synthetic_series, pc1_scores, explained_var, loadings)
-
-        Performance: full PCA refit is O(T*N^2). For 1000×43 that's ~2ms.
-        We still cache to avoid redundant computation on every cycle.
-        """
         if not PCA_AVAILABLE:
             return None, None, 0.0, None
 
@@ -98,7 +68,6 @@ class RegimeDetector:
         if price_matrix.shape[0] < 10 or price_matrix.shape[1] < 2:
             return None, None, 0.0, None
 
-        # Log returns
         returns = np.log(price_matrix[1:] / price_matrix[:-1])
         returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -110,7 +79,6 @@ class RegimeDetector:
         )
 
         if need_refit:
-            # Full PCA refit
             mu = returns.mean(axis=0, keepdims=True)
             sigma = returns.std(axis=0, keepdims=True)
             sigma[sigma == 0] = 1.0
@@ -121,22 +89,17 @@ class RegimeDetector:
             explained_var = float(pca.explained_variance_ratio_[0])
             loadings = pca.components_[0].copy()
 
-            # Sign convention: positive average loading
             if loadings.mean() < 0:
                 pc1_scores = -pc1_scores
                 loadings = -loadings
 
-            # Cache for fast projection between refits
             self._pca_loadings = loadings
             self._pca_mean = mu.flatten()
             self._pca_std = sigma.flatten()
             self._pca_explained_var = explained_var
             self._pca_last_fit = now
 
-            log.info(f"PCA refit: explained_var={explained_var:.3f}, "
-                     f"n_assets={returns.shape[1]}")
         else:
-            # Fast projection using cached loadings (just a dot product)
             std = self._pca_std.copy()
             std[std == 0] = 1.0
             with np.errstate(all='ignore'):
@@ -147,44 +110,12 @@ class RegimeDetector:
             loadings = self._pca_loadings
             explained_var = self._pca_explained_var
 
-        # Synthetic price series for HMM compatibility
         synthetic_series = np.exp(np.insert(np.cumsum(pc1_scores), 0, 0.0))
         self._pc1_series = synthetic_series
 
         return synthetic_series, pc1_scores, explained_var, loadings
 
-    # ─── Rule-Based Regime ─────────────────────────────────────
-
-    def classify_regime_rules(self, market_features: dict) -> int:
-        breadth = market_features.get("breadth", 0.5)
-        trend = market_features.get("trend_strength", 0)
-        downside = market_features.get("mkt_downside_vol", 0)
-        cost = market_features.get("cost_stress", 0)
-
-        downside_norm = min(1.0, downside / 0.5) if downside > 0 else 0
-        cost_norm = min(1.0, cost / 0.001) if cost > 0 else 0
-
-        # Regime score: breadth and trend push positive, stress pushes negative.
-        # Reduced stress penalties — previous weights made neutral markets HOSTILE.
-        # breadth=0.5, trend=0 should be SELECTIVE, not HOSTILE.
-        score = (
-            (breadth - 0.5) * 2.0
-            + np.clip(trend * 20, -1, 1)
-            - downside_norm * 0.3   # reduced from 0.5 — was too harsh
-            - cost_norm * 0.15      # reduced from 0.3
-        )
-
-        if score > 0.2:
-            return TREND_SUPPORTIVE
-        elif score < -0.5:
-            return HOSTILE
-        else:
-            return SELECTIVE
-
-    # ─── HMM (on PC1 series) ──────────────────────────────────
-
-    def fit_hmm(self, pc1_series: np.ndarray, lookback: int = 720):
-        """Fit 2-state HMM on PC1 synthetic price series."""
+    def fit_hmm(self, pc1_series: np.ndarray, lookback: int = 1440):
         if not HMM_AVAILABLE or len(pc1_series) < 50:
             return
 
@@ -206,27 +137,37 @@ class RegimeDetector:
             return
 
         try:
+            # 1. Change to 3 states to capture Extreme/Hostile environments
             self.hmm_model = GaussianHMM(
-                n_components=2, covariance_type="full",
-                n_iter=100, random_state=42,
+                n_components=3, covariance_type="full",
+                n_iter=300, random_state=70,
             )
             self.hmm_model.fit(features)
 
+            # 2. Extract the volatility means of the 3 clusters
             vol_means = self.hmm_model.means_[:, 1]
-            if vol_means[0] <= vol_means[1]:
-                self._hmm_state_map = {0: TREND_SUPPORTIVE, 1: SELECTIVE}
-            else:
-                self._hmm_state_map = {0: SELECTIVE, 1: TREND_SUPPORTIVE}
+            
+            # 3. Sort the clusters from lowest volatility to highest volatility
+            # argsort returns the cluster IDs (0, 1, 2) in ascending order of their volatility
+            sorted_state_ids = np.argsort(vol_means)
+
+            # 4. Map the sorted clusters to your 3 regimes
+            self._hmm_state_map = {
+                sorted_state_ids[0]: TREND_SUPPORTIVE,  # Lowest vol   -> 1.00x exposure
+                sorted_state_ids[1]: SELECTIVE,         # Middle vol   -> 0.75x exposure
+                sorted_state_ids[2]: HOSTILE            # Highest vol  -> 0.25x exposure
+            }
 
             states = self.hmm_model.predict(features)
             self.hmm_regime = self._hmm_state_map.get(states[-1], SELECTIVE)
             self.hmm_fitted = True
             log.info(f"HMM fitted on PC1: state={REGIME_NAMES[self.hmm_regime]}")
+            
         except Exception as e:
-            log.debug(f"HMM fit failed: {e}")
+            # Now properly logging as a warning so you can see convergence failures!
+            log.warning(f"HMM fit failed to converge: {e}")
 
     def update_hmm(self, pc1_series: np.ndarray):
-        """Lightweight HMM predict using cached model on latest PC1."""
         if not self.hmm_fitted or self.hmm_model is None:
             return
         if len(pc1_series) < 30:
@@ -245,25 +186,17 @@ class RegimeDetector:
         except Exception:
             pass
 
-    # ─── Combined Decision ─────────────────────────────────────
-
-    def update(self, market_features: dict, pc1_series: np.ndarray = None):
-        """Update regime from rule-based features + PCA-HMM.
-
-        Uses more conservative of the two when they disagree.
-        """
-        self.market_features = market_features
-        self.rule_regime = self.classify_regime_rules(market_features)
-
+    def update(self, market_feats: dict = None, pc1_series: np.ndarray = None):
+        """Update regime using ONLY the PCA-HMM."""
         if pc1_series is not None and len(pc1_series) > 30:
             self.update_hmm(pc1_series)
 
         if self.hmm_fitted:
-            self.current_regime = max(self.rule_regime, self.hmm_regime)
-            self.regime_confidence = 1.0 if self.rule_regime == self.hmm_regime else 0.6
+            self.current_regime = self.hmm_regime
+            self.regime_confidence = 1.0
         else:
-            self.current_regime = self.rule_regime
-            self.regime_confidence = 0.7
+            self.current_regime = SELECTIVE
+            self.regime_confidence = 0.0
 
     def get_exposure_multiplier(self) -> float:
         return EXPOSURE_MULTIPLIERS.get(self.current_regime, 0.6)
@@ -274,12 +207,9 @@ class RegimeDetector:
     def get_status(self) -> dict:
         return {
             "regime": REGIME_NAMES.get(self.current_regime, "UNKNOWN"),
-            "rule_regime": REGIME_NAMES.get(self.rule_regime, "UNKNOWN"),
-            "hmm_regime": REGIME_NAMES.get(self.hmm_regime, "UNKNOWN"),
             "confidence": round(self.regime_confidence, 3),
             "exposure_mult": round(self.get_exposure_multiplier(), 3),
             "should_trade": self.should_trade(),
-            "market_features": self.market_features,
             "hmm_fitted": self.hmm_fitted,
             "pca_explained_var": round(self._pca_explained_var, 3),
         }
