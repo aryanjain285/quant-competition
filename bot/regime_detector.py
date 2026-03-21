@@ -115,7 +115,7 @@ class RegimeDetector:
 
         return synthetic_series, pc1_scores, explained_var, loadings
 
-    def fit_hmm(self, pc1_series: np.ndarray, lookback: int = 720):
+    def fit_hmm(self, pc1_series: np.ndarray, lookback: int = 1440):
         if not HMM_AVAILABLE or len(pc1_series) < 50:
             return
 
@@ -137,24 +137,35 @@ class RegimeDetector:
             return
 
         try:
+            # 1. Change to 3 states to capture Extreme/Hostile environments
             self.hmm_model = GaussianHMM(
-                n_components=2, covariance_type="full",
-                n_iter=100, random_state=42,
+                n_components=3, covariance_type="full",
+                n_iter=300, random_state=70,
             )
             self.hmm_model.fit(features)
 
+            # 2. Extract the volatility means of the 3 clusters
             vol_means = self.hmm_model.means_[:, 1]
-            if vol_means[0] <= vol_means[1]:
-                self._hmm_state_map = {0: TREND_SUPPORTIVE, 1: SELECTIVE}
-            else:
-                self._hmm_state_map = {0: SELECTIVE, 1: TREND_SUPPORTIVE}
+            
+            # 3. Sort the clusters from lowest volatility to highest volatility
+            # argsort returns the cluster IDs (0, 1, 2) in ascending order of their volatility
+            sorted_state_ids = np.argsort(vol_means)
+
+            # 4. Map the sorted clusters to your 3 regimes
+            self._hmm_state_map = {
+                sorted_state_ids[0]: TREND_SUPPORTIVE,  # Lowest vol   -> 1.00x exposure
+                sorted_state_ids[1]: SELECTIVE,         # Middle vol   -> 0.75x exposure
+                sorted_state_ids[2]: HOSTILE            # Highest vol  -> 0.25x exposure
+            }
 
             states = self.hmm_model.predict(features)
             self.hmm_regime = self._hmm_state_map.get(states[-1], SELECTIVE)
             self.hmm_fitted = True
             log.info(f"HMM fitted on PC1: state={REGIME_NAMES[self.hmm_regime]}")
+            
         except Exception as e:
-            log.debug(f"HMM fit failed: {e}")
+                # Now properly logging as a warning so you can see convergence failures!
+                log.warning(f"HMM fit failed to converge: {e}")
 
     def update_hmm(self, pc1_series: np.ndarray):
         if not self.hmm_fitted or self.hmm_model is None:

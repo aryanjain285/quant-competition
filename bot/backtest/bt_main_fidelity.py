@@ -44,7 +44,7 @@ DOWNLOAD_MONTHS = 4
 DEFAULT_PRICE_PRECISION = 4
 DEFAULT_AMOUNT_PRECISION = 6
 DEFAULT_MIN_ORDER_USD = 10.0
-DEFAULT_SPREAD_BPS = 6.0      
+DEFAULT_SPREAD_BPS = 6.0    
 LIMIT_FILL_BUFFER_BPS = 1.0   
 
 @dataclass
@@ -445,7 +445,7 @@ def main():
     all_candles = {p: v[:min_len] for p, v in all_candles.items() if p in usable_pairs}
     bt = HistoricalMainLikeBacktest(all_candles, default_exchange_info(list(all_candles.keys())))
 
-    print(f"\n[TEST 1] 4-MONTH CONTINUOUS RUN (Using rolling ML model)")
+    print(f"\n[TEST 1] {DOWNLOAD_MONTHS}-MONTH CONTINUOUS RUN (Using rolling ML model)")
     full = bt.run_window(WARMUP_BARS, min_len)
 
     print("\n[TEST 2] ROLLING 10-DAY WINDOWS")
@@ -469,15 +469,6 @@ def main():
     print(f"      Composite:     {f_m['composite']:>8.2f}")
     print(f"      Total Trades:  {len(full['trade_log']):>8}")
 
-    if results:
-        print("\n  [2] ROLLING 10-DAY WINDOWS (AVERAGES)")
-        print(f"      Avg Return:    {np.mean([m['total_return_pct'] for m in results]):>8.2f}%")
-        print(f"      Avg Max DD:    {np.mean([m['max_drawdown_pct'] for m in results]):>8.2f}%")
-        print(f"      Avg Sharpe:    {np.mean([m['sharpe'] for m in results]):>8.2f}")
-        print(f"      Avg Sortino:   {np.mean([m['sortino'] for m in results]):>8.2f}")
-        print(f"      Avg Calmar:    {np.mean([m['calmar'] for m in results]):>8.2f}")
-        print(f"      Avg Compos:    {np.mean([m['composite'] for m in results]):>8.2f}")
-        print(f"      Avg Trades:    {np.mean([m['trades'] for m in results]):>8.1f}")
     print("=" * 70 + "\n")
 
 if __name__ == "__main__":
