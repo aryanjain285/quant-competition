@@ -31,7 +31,7 @@ import signal
 import traceback
 import numpy as np
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from sklearn.linear_model import RidgeCV
 
 from bot.config import (
@@ -70,6 +70,19 @@ signal.signal(signal.SIGTERM, _shutdown)
 CONTINUATION_SCORE_THRESHOLD = 0.08
 REVERSAL_SCORE_THRESHOLD = 0.13
 
+
+def _next_hour_boundary(delay_seconds: int = 5) -> float:
+    now = datetime.now(timezone.utc)
+    next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    target = next_hour + timedelta(seconds=delay_seconds)
+    return target.timestamp()
+
+def _sleep_until(ts: float):
+    while _running:
+        remaining = ts - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(1.0, remaining))
 
 class TradingBot:
     """Main trading bot orchestrator — v4 integrated pipeline."""
@@ -325,7 +338,20 @@ class TradingBot:
             self.regime.fit_hmm(pc1_series)
 
         self.risk_mgr.set_regime_multiplier(self.regime.get_exposure_multiplier())
-        self.executor.manage_pending_orders()
+        fill_events = self.executor.manage_pending_orders()
+        for evt in fill_events:
+            pair = evt["pair"]
+            qty = evt["filled_qty"]
+            side = evt["side"]
+            px = evt["filled_avg_price"]
+
+            if side == "BUY" and qty > 0:
+                self.positions[pair] = self.positions.get(pair, 0) + qty
+                self.risk_mgr.update_trailing_stop(
+                    pair, px, strategy="breakout", entry_price=px
+                )
+            elif side == "SELL" and qty > 0:
+                self.positions[pair] = max(0.0, self.positions.get(pair, 0) - qty)
 
         if not self.regime.should_trade():
             log.info(f"REGIME HOSTILE — no new entries. Regime: {self.regime.get_status()['regime']}")
@@ -536,35 +562,30 @@ class TradingBot:
         })
 
     def run(self):
-        global _running
-
         log.info("=" * 60)
-        log.info("TRADING BOT v4 STARTING")
+        log.info("TRADING BOT v5 STARTING")
         log.info(f"Poll interval: {POLL_INTERVAL_SECONDS}s")
         log.info(f"Active pairs: {len(self.active_pairs)}")
-        log.info(f"Pipeline: regime → events → valid trades → ranking → execution")
-        log.info(f"Regime: rule-based + HMM | Signals: continuation + reversal")
-        log.info(f"Ranking: hand-built score (ridge-ready)")
         log.info("=" * 60)
 
         self.load_historical_data()
 
         while _running:
             try:
-                log.info(f"About to run cycle {self.cycle_count + 1}")
                 self.run_cycle()
-                log.info(f"Finished cycle {self.cycle_count}")
             except Exception as e:
-                log.error(f"Cycle error: {e}\n{traceback.format_exc()}")
+                log.error(f"Fatal error in cycle: {e}")
+                log.error(traceback.format_exc())
 
-            next_cycle = time.time() + POLL_INTERVAL_SECONDS
-            while _running and time.time() < next_cycle:
-                time.sleep(1)
+            # wake up at the next top-of-hour + 5s
+            wake_ts = _next_hour_boundary(delay_seconds=5)
+            log.info(
+                f"Sleeping until next hour boundary: "
+                f"{datetime.fromtimestamp(wake_ts, tz=timezone.utc).isoformat()}"
+            )
+            _sleep_until(wake_ts)
 
-        log.info("Bot shutting down.")
-        metrics = self.perf.summary()
-        log.info(f"FINAL METRICS: {metrics}")
-
+        log.info("Bot stopped cleanly.")
 
 def main():
     bot = TradingBot()
