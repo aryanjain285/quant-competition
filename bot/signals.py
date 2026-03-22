@@ -48,27 +48,27 @@ def check_continuation(features: dict, zscored: dict) -> dict:
     result["reasons"].append("r24h_positive")
 
     # 3. Persistence high (move is internally consistent)
-    if features.get("persistence", 0.5) < 0.52:
+    if features.get("persistence", 0.5) < 0.47:
         return result
     result["reasons"].append("persistent")
 
     # 4. Choppiness low (path is clean)
-    if features.get("choppiness", 0.5) > 0.85:
+    if features.get("choppiness", 0.5) > 0.88:
         return result
     result["reasons"].append("clean_path")
 
     # 5. Volume confirmed (mandatory — v3 proven)
-    if features.get("volume_ratio", 1.0) < 1.3:
+    if features.get("volume_ratio", 1.0) < 1.05:
         return result
     result["reasons"].append("volume")
 
     # 6. Risk penalty not extreme (z-scored)
-    if zscored.get("risk_penalty", 0) > 1.5:
+    if zscored.get("risk_penalty", 0) > 2.00:
         return result
     result["reasons"].append("risk_ok")
 
     # 7. Cost penalty not extreme (z-scored)
-    if zscored.get("cost_penalty", 0) > 1.5:
+    if zscored.get("cost_penalty", 0) > 2.00:
         return result
     result["reasons"].append("cost_ok")
 
@@ -97,7 +97,7 @@ def check_reversal(features: dict, zscored: dict) -> dict:
 
     # Overshoot must be extreme (large negative z-score = unusually large drop)
     overshoot = features.get("overshoot", 0)
-    if overshoot > -1.5:
+    if overshoot > -1.3:
         # Not oversold enough — overshoot is negative for drops
         return result
     result["reasons"].append(f"oversold(z={overshoot:.1f})")
@@ -111,14 +111,14 @@ def check_reversal(features: dict, zscored: dict) -> dict:
     result["reasons"].append("risk_manageable")
 
     # Cost must be acceptable
-    if zscored.get("cost_penalty", 0) > 1.5:
+    if zscored.get("cost_penalty", 0) > 1.8:
         return result
     result["reasons"].append("cost_ok")
 
     # Recent price action should show some stabilization
     # (not free-falling — r_1h should not be deeply negative)
     r_1h = features.get("r_1h", 0)
-    if r_1h < -0.03:
+    if r_1h < -0.025:
         return result  # still crashing, don't catch falling knife
     result["reasons"].append("stabilizing")
 
@@ -184,7 +184,7 @@ def compute_signal(
         "down_vol": raw_features.get("downside_vol", 0),
         "spread": raw_features.get("spread_pct", 0),
         "breakout_strength": raw_features.get("breakout_distance", 0),
-        "volume_confirm": raw_features.get("volume_ratio", 1.0) > 1.3,
+        "volume_confirm": raw_features.get("volume_ratio", 1.0) > 1.05,
     }
 
     # Check continuation (trend-following)

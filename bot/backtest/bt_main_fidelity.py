@@ -16,7 +16,7 @@ from typing import Optional
 import numpy as np
 import requests
 
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import RidgeCV
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_THIS_DIR) if os.path.basename(_THIS_DIR) == "backtest" else _THIS_DIR
@@ -38,14 +38,18 @@ INITIAL_CASH = 1_000_000.0
 INTERVAL_MS = 3_600_000
 WINDOW_BARS = 240
 STEP_BARS = 72
-WARMUP_BARS = 500  # Increased for ML lookback
+WARMUP_BARS = 600
 DOWNLOAD_MONTHS = 4
 
 DEFAULT_PRICE_PRECISION = 4
 DEFAULT_AMOUNT_PRECISION = 6
 DEFAULT_MIN_ORDER_USD = 10.0
-DEFAULT_SPREAD_BPS = 6.0    
+DEFAULT_SPREAD_BPS = 6.0
 LIMIT_FILL_BUFFER_BPS = 1.0   
+
+# Backtest score scale differs from live, but structure matches: easier continuation, stricter reversal.
+CONTINUATION_SCORE_THRESHOLD = 0.0025
+REVERSAL_SCORE_THRESHOLD = 0.0050
 
 @dataclass
 class SimulationContext:
@@ -246,7 +250,7 @@ class HistoricalMainLikeBacktest:
                 y_train.append((cf - c0) / c0)
                 
         if len(X_train) > 50:
-            model = Ridge(alpha=1.0)
+            model = RidgeCV(alphas=np.logspace(-3, 1, 100))
             model.fit(X_train, y_train)
             return model
         return None
@@ -289,6 +293,7 @@ class HistoricalMainLikeBacktest:
             # RIDGE TRAINING INJECTION
             if cycle_count % 24 == 1:
                 try:
+
                     new_model = self.train_ridge_model(t, ranker.ridge_features)
                     if new_model: ranker.set_ridge_model(new_model)
                 except Exception: pass
@@ -341,23 +346,51 @@ class HistoricalMainLikeBacktest:
                         trade_log.append({"pair": pair, "reason": reason})
                 continue
 
+            # ══════════════════════════════════════════════════════
+            # STEP 2 & 3: EVENT FILTER AND ADMISSION GATES
+            # ══════════════════════════════════════════════════════
             all_zscored = zscore_universe(all_raw_features)
             for pair in all_zscored: compute_submodel_scores(all_zscored[pair])
 
             signals = {}
             valid_candidates = {}
+            current_regime_name = regime.get_status().get("regime", "UNKNOWN")
+
             for pair in all_raw_features:
                 hist = self.all_candles[pair][:t+1]
                 closes = np.array([x["close"] for x in hist])
                 lows = np.array([x["low"] for x in hist])
                 sig = compute_signal(all_raw_features[pair], all_zscored[pair], closes, lows, BREAKOUT_LOOKBACK)
                 signals[pair] = sig
+
                 if sig["action"] == "BUY" and positions.get(pair, 0) <= 0:
-                    valid_candidates[pair] = all_zscored.get(pair, {})
+                    strategy = sig.get("strategy", "none")
+                    strength = sig.get("strength", 0)
+                    z_feats = all_zscored.get(pair, {})
+                    risk_penalty = z_feats.get("risk_penalty", 1.0)
+                    cost_penalty = z_feats.get("cost_penalty", 1.0)
+
+                    # --- EDIT 1: REGIME GATING (Loosened) ---
+                    # In SELECTIVE regime, allow continuations ONLY IF they are exceptionally strong
+                    if strategy == "continuation" and current_regime_name == "SELECTIVE":
+                        if strength < 0.68:
+                            continue
+                    
+                    # --- EDIT 2: HARD CANDIDATE ADMISSION FILTER (Loosened) ---
+                    if strength < 0.45: continue
+                    if risk_penalty > 1.75: continue
+                    if cost_penalty > 1.75: continue
+
+                    valid_candidates[pair] = z_feats
                     valid_candidates[pair]["_signal"] = sig
 
-            ranked = ranker.rank(valid_candidates, max_results=MAX_POSITIONS)
+            # ══════════════════════════════════════════════════════
+            # STEP 4: RANKING (DYNAMIC MAX POSITIONS)
+            # ══════════════════════════════════════════════════════
+            dynamic_max_positions = 4 if current_regime_name == "TREND_SUPPORTIVE" else 3
+            ranked = ranker.rank(valid_candidates, max_results=dynamic_max_positions)
 
+            # Check trailing stops on existing positions
             for pair, qty in list(positions.items()):
                 tick = ticker_data.get(pair, {})
                 price = tick.get("LastPrice", 0)
@@ -368,24 +401,37 @@ class HistoricalMainLikeBacktest:
                     if exit_frac >= 1.0: risk_mgr.clear_trailing_stop(pair)
                     trade_log.append({"pair": pair, "reason": reason})
 
+            # ══════════════════════════════════════════════════════
+            # STEP 5: EXECUTION (RANK SCORE THRESHOLD)
+            # ══════════════════════════════════════════════════════
             total_exposure = sum(qty * ticker_data.get(p, {}).get("LastPrice", 0) for p, qty in positions.items())
             num_positions = len(positions)
 
             for pair, score, features in ranked:
-                if num_positions >= MAX_POSITIONS: break
+                if num_positions >= dynamic_max_positions: break
+                
                 sig = features.get("_signal", {})
+                strategy = sig.get("strategy", "none")
+                
+                # Keep both sleeves active, but require more evidence for reversals.
+                if strategy == "continuation" and score < CONTINUATION_SCORE_THRESHOLD:
+                    continue
+                if strategy == "reversal" and score < REVERSAL_SCORE_THRESHOLD:
+                    continue
+
                 tick = ticker_data.get(pair, {})
                 price = tick.get("LastPrice", 0)
                 size_usd = risk_mgr.position_size_usd(pair, all_raw_features.get(pair, {}).get("realized_vol", 0.5), total_exposure, num_positions, signal_strength=sig.get("strength", 0.5))
+                
                 if size_usd >= 50:
                     result = executor.buy(pair, size_usd, price, tick.get("MaxBid",0), tick.get("MinAsk",0), use_limit=USE_LIMIT_ORDERS)
                     if result and result.get("Success"):
-                        strategy = sig.get("strategy", "continuation")
                         risk_mgr.update_trailing_stop(pair, price, strategy="mean_rev" if strategy == "reversal" else "breakout", entry_price=price)
                         total_exposure += size_usd
                         num_positions += 1
                         trade_log.append({"pair": pair, "reason": "buy", "strategy": strategy})
 
+            # Handle sell signals
             for pair, sig in signals.items():
                 if sig["action"] == "SELL" and positions.get(pair, 0) > 0:
                     tick = ticker_data.get(pair, {})
@@ -433,7 +479,7 @@ def load_all_history(pairs: list[str]) -> dict[str, list[dict]]:
 
 def main():
     print("=" * 70)
-    print("  LEAN V5 BACKTEST (RIDGE REGRESSION & STRICT FEES)")
+    print("  LEAN V5 BACKTEST (RIDGE ML AND STRICT FEES)")
     print("=" * 70)
 
     pairs = [p for p in TRADEABLE_COINS if p in BINANCE_SYMBOL_MAP]
@@ -458,9 +504,9 @@ def main():
         results.append(m)
         print(f"  Window {s // 24:>3}: Ret={m['total_return_pct']:>+6.2f}% | Comp={m['composite']:>6.2f} | Trades={m['trades']:>3}")
 
-    print("\n" + "=" * 70 + "\n  FINAL BACKTEST SCORECARD (RIDGE ML)\n" + "=" * 70)
+    print("\n" + "=" * 70 + "\n  FINAL BACKTEST SCORECARD (ML BASE RANKING)\n" + "=" * 70)
     f_m = full["summary"]
-    print("\n  [1] LONG-TERM CONTINUOUS (4 MONTHS)")
+    print(f"\n  [1] LONG-TERM CONTINUOUS ({DOWNLOAD_MONTHS} MONTHS)")
     print(f"      Total Return:  {f_m['total_return_pct']:>8.2f}%")
     print(f"      Max Drawdown:  {f_m['max_drawdown_pct']:>8.2f}%")
     print(f"      Sharpe:        {f_m['sharpe']:>8.2f}")
@@ -468,6 +514,16 @@ def main():
     print(f"      Calmar:        {f_m['calmar']:>8.2f}")
     print(f"      Composite:     {f_m['composite']:>8.2f}")
     print(f"      Total Trades:  {len(full['trade_log']):>8}")
+
+    if results:
+        print("\n  [2] ROLLING 10-DAY WINDOWS (AVERAGES)")
+        print(f"      Avg Return:    {np.mean([m['total_return_pct'] for m in results]):>8.2f}%")
+        print(f"      Avg Max DD:    {np.mean([m['max_drawdown_pct'] for m in results]):>8.2f}%")
+        print(f"      Avg Sharpe:    {np.mean([m['sharpe'] for m in results]):>8.2f}")
+        print(f"      Avg Sortino:   {np.mean([m['sortino'] for m in results]):>8.2f}")
+        print(f"      Avg Calmar:    {np.mean([m['calmar'] for m in results]):>8.2f}")
+        print(f"      Avg Compos:    {np.mean([m['composite'] for m in results]):>8.2f}")
+        print(f"      Avg Trades:    {np.mean([m['trades'] for m in results]):>8.1f}")
 
     print("=" * 70 + "\n")
 

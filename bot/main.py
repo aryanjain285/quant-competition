@@ -32,7 +32,7 @@ import traceback
 import numpy as np
 from typing import Optional
 from datetime import datetime, timezone
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import RidgeCV
 
 from bot.config import (
     POLL_INTERVAL_SECONDS, TRADEABLE_COINS,
@@ -64,6 +64,11 @@ def _shutdown(signum, frame):
 
 signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
+
+
+# Entry gates tuned for a decent, active bot: continuation-first, selective reversals.
+CONTINUATION_SCORE_THRESHOLD = 0.08
+REVERSAL_SCORE_THRESHOLD = 0.13
 
 
 class TradingBot:
@@ -216,7 +221,7 @@ class TradingBot:
                 y_train.append(target_return)
 
         if len(X_train) > 50:
-            model = Ridge(alpha=1.0)
+            model = RidgeCV(alphas=np.logspace(-3, 1, 100))
             model.fit(X_train, y_train)
             self.ranker.set_ridge_model(model)
             log.info(f"Ridge model trained on {len(X_train)} samples & passed to Ranker.")
@@ -375,6 +380,23 @@ class TradingBot:
         for pair, score, features in ranked:
             if num_positions >= MAX_POSITIONS:
                 break
+
+            # Keep both sleeves live, but make reversals earn their spot.
+            sig = features.get("_signal", {})
+            strategy = sig.get("strategy", "none")
+            
+            if strategy == "continuation" and score < CONTINUATION_SCORE_THRESHOLD:
+                log.info(
+                    f"Skipping {pair}: score {score:.3f} below continuation threshold "
+                    f"({CONTINUATION_SCORE_THRESHOLD:.2f})"
+                )
+                continue
+            if strategy == "reversal" and score < REVERSAL_SCORE_THRESHOLD:
+                log.info(
+                    f"Skipping {pair}: score {score:.3f} below reversal threshold "
+                    f"({REVERSAL_SCORE_THRESHOLD:.2f})"
+                )
+                continue
 
             sig = features.get("_signal", {})
             tick = ticker_data.get(pair, {})

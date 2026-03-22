@@ -34,8 +34,8 @@ REGIME_NAMES = {0: "TREND_SUPPORTIVE", 1: "SELECTIVE", 2: "HOSTILE"}
 
 EXPOSURE_MULTIPLIERS = {
     TREND_SUPPORTIVE: 1.0,
-    SELECTIVE: 0.75,
-    HOSTILE: 0.25,
+    SELECTIVE: 0.5,
+    HOSTILE: 0.1,
 }
 
 class RegimeDetector:
@@ -122,7 +122,7 @@ class RegimeDetector:
         prices = pc1_series[-lookback:]
         log_returns = np.diff(np.log(np.clip(prices, 1e-10, None)))
 
-        vol_window = 24
+        vol_window = 20
         rolling_vol = np.array([
             np.std(log_returns[max(0, i - vol_window):i])
             if i > vol_window else np.std(log_returns[:i + 1])
