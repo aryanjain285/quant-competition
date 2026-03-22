@@ -86,8 +86,9 @@ class Executor:
             )
             if result and result.get("Success"):
                 detail = result.get("OrderDetail", {})
-                if detail.get("Status") == "PENDING":
-                    self.pending_orders[detail["OrderID"]] = {
+                order_id = detail.get("OrderID")
+                if detail.get("Status") == "PENDING" and order_id is not None:
+                    self.pending_orders[order_id] = {
                         "pair": pair, "side": "BUY",
                         "time_placed": time.time(),
                         "price": limit_price, "quantity": coin_qty,
@@ -144,8 +145,9 @@ class Executor:
             )
             if result and result.get("Success"):
                 detail = result.get("OrderDetail", {})
-                if detail.get("Status") == "PENDING":
-                    self.pending_orders[detail["OrderID"]] = {
+                order_id = detail.get("OrderID")
+                if detail.get("Status") == "PENDING" and order_id is not None:
+                    self.pending_orders[order_id] = {
                         "pair": pair, "side": "SELL",
                         "time_placed": time.time(),
                         "price": limit_price, "quantity": coin_quantity,
@@ -165,33 +167,60 @@ class Executor:
             self._log_trade_record(result.get("OrderDetail", {}), pair, "SELL", coin_quantity, current_price)
         return result
 
-    def manage_pending_orders(self):
-        """Cancel stale pending limit orders that haven't filled."""
+    def manage_pending_orders(self) -> list[dict]:
+        """Check tracked pending orders, clean up filled ones, cancel stale ones."""
         if not self.pending_orders:
-            return
+            return []
 
         now = time.time()
-        stale_ids = []
+        fill_events = []
 
-        for order_id, info in self.pending_orders.items():
+        for order_id in list(self.pending_orders.keys()):
+            info = self.pending_orders.get(order_id)
+            if not info:
+                continue
+
+            matches = self.client.query_order(order_id=order_id)
+            if matches:
+                od = matches[0]
+                status = str(od.get("Status", "")).upper()
+                filled_qty = float(od.get("FilledQuantity", 0) or 0)
+
+                if status in {"FILLED", "CANCELED", "CANCELLED", "REJECTED"}:
+                    if filled_qty > 0:
+                        fill_events.append({
+                            "pair": info["pair"],
+                            "side": info["side"],
+                            "filled_qty": filled_qty,
+                            "filled_avg_price": float(od.get("FilledAverPrice", 0) or 0),
+                        })
+                    self.pending_orders.pop(order_id, None)
+                    continue
+
             age = now - info["time_placed"]
             if age > LIMIT_ORDER_TIMEOUT_SECONDS:
-                stale_ids.append(order_id)
+                log.info(f"Cancelling stale order {order_id} ({info['pair']} {info['side']})")
+                self.client.cancel_order(order_id=order_id)
+                self.pending_orders.pop(order_id, None)
 
-        for order_id in stale_ids:
-            info = self.pending_orders[order_id]
-            log.info(f"Cancelling stale order {order_id} ({info['pair']} {info['side']})")
-            self.client.cancel_order(order_id=order_id)
-            del self.pending_orders[order_id]
-
-            # Resubmit as market order if it was a buy
-            # (sells due to stop loss should be immediate)
-            if info["side"] == "SELL":
-                log.info(f"Resubmitting stale sell as MARKET: {info['pair']}")
-                self.client.place_order(
-                    pair=info["pair"], side="SELL",
-                    quantity=info["quantity"], order_type="MARKET",
+                result = self.client.place_order(
+                    pair=info["pair"],
+                    side=info["side"],
+                    quantity=info["quantity"],
+                    order_type="MARKET",
                 )
+                if result and result.get("Success"):
+                    detail = result.get("OrderDetail", {})
+                    filled_qty = float(detail.get("FilledQuantity", 0) or 0)
+                    if filled_qty > 0:
+                        fill_events.append({
+                            "pair": info["pair"],
+                            "side": info["side"],
+                            "filled_qty": filled_qty,
+                            "filled_avg_price": float(detail.get("FilledAverPrice", 0) or 0),
+                        })
+        return fill_events
+    
 
     def cancel_all_pending(self):
         """Cancel all pending orders (used during drawdown breakers)."""

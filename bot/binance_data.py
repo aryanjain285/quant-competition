@@ -52,6 +52,10 @@ class BinanceData:
             log.error(f"klines failed for {pair} ({symbol}): {e}")
             return None
 
+        if not isinstance(raw, list):
+            log.error(f"klines returned non-list for {pair}: {str(raw)[:100]}")
+            return None
+
         candles = []
         for k in raw:
             candles.append({
@@ -87,7 +91,7 @@ class BinanceData:
         """
         pairs = pairs or TRADEABLE_COINS
         for pair in pairs:
-            candles = self.fetch_klines(pair, interval="5m", limit=3)
+            candles = self.fetch_klines(pair, interval="1h", limit=3)
             if not candles:
                 continue
 
