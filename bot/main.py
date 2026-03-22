@@ -323,7 +323,23 @@ class TradingBot:
             self.regime.fit_hmm(pc1_series)
 
         self.risk_mgr.set_regime_multiplier(self.regime.get_exposure_multiplier())
-        self.executor.manage_pending_orders()
+
+        # Process pending limit orders — capture fills to update positions
+        fill_events = self.executor.manage_pending_orders()
+        for fill in fill_events:
+            pair = fill["pair"]
+            filled_qty = fill["filled_qty"]
+            if fill["side"] == "BUY" and filled_qty > 0:
+                self.positions[pair] = self.positions.get(pair, 0) + filled_qty
+                self.risk_mgr.update_trailing_stop(
+                    pair, fill["filled_avg_price"],
+                    strategy="breakout",
+                    entry_price=fill["filled_avg_price"],
+                )
+                log.info(f"PENDING FILL [BUY]: {pair} qty={filled_qty:.6f} @ {fill['filled_avg_price']:.2f}")
+            elif fill["side"] == "SELL" and filled_qty > 0:
+                self.positions[pair] = max(0, self.positions.get(pair, 0) - filled_qty)
+                log.info(f"PENDING FILL [SELL]: {pair} qty={filled_qty:.6f}")
 
         if not self.regime.should_trade():
             log.info(f"REGIME HOSTILE — no new entries. Regime: {self.regime.get_status()['regime']}")
