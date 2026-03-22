@@ -31,8 +31,7 @@ import signal
 import traceback
 import numpy as np
 from typing import Optional
-from datetime import datetime, timezone, timedelta
-from sklearn.linear_model import RidgeCV
+from datetime import datetime, timezone
 
 from bot.config import (
     POLL_INTERVAL_SECONDS, TRADEABLE_COINS,
@@ -66,23 +65,9 @@ signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
 
 
-# Entry gates tuned for a decent, active bot: continuation-first, selective reversals.
-CONTINUATION_SCORE_THRESHOLD = 0.08
-REVERSAL_SCORE_THRESHOLD = 0.13
+CONTINUATION_SCORE_THRESHOLD = 0.15
+REVERSAL_SCORE_THRESHOLD = 0.20
 
-
-def _next_hour_boundary(delay_seconds: int = 5) -> float:
-    now = datetime.now(timezone.utc)
-    next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    target = next_hour + timedelta(seconds=delay_seconds)
-    return target.timestamp()
-
-def _sleep_until(ts: float):
-    while _running:
-        remaining = ts - time.time()
-        if remaining <= 0:
-            break
-        time.sleep(min(1.0, remaining))
 
 class TradingBot:
     """Main trading bot orchestrator — v4 integrated pipeline."""
@@ -128,6 +113,7 @@ class TradingBot:
         # ── Intelligence layers ──
         self.regime = RegimeDetector()
         self.ranker = Ranker()
+        self.ridge_trainer = RidgeTrainer(self.active_pairs)
 
         # ── Risk & execution ──
         self.risk_mgr = RiskManager(initial_value)
@@ -194,51 +180,50 @@ class TradingBot:
         min_len = min(len(x) for x in close_series)
         return np.column_stack([x[-min_len:] for x in close_series])
     
-    def _train_ridge_model(self, lookback_hours: int = 400, forward_horizon: int = 24):
-        """Trains Ridge regression targeting +24h returns using BinanceData."""
-        min_len = min((len(self.binance.get_closes(p)) for p in self.active_pairs), default=0)
-        if min_len < lookback_hours + forward_horizon + 100:
-            return  # Not enough data yet
+    def _build_historical_data_for_ml(self) -> dict[str, list[dict]]:
+        """Convert BinanceData arrays into the dict-of-bars format expected by RidgeTrainer."""
+        historical_data = {}
+        for pair in self.active_pairs:
+            closes = self.binance.get_closes(pair)
+            highs = self.binance.get_highs(pair)
+            lows = self.binance.get_lows(pair)
+            volumes = self.binance.get_volumes(pair)
 
-        log.info(f"Training Ridge ML Model (Lookback: {lookback_hours}h)...")
-        X_train, y_train = [], []
-        features_to_use = self.ranker.ridge_features
+            min_len = min(len(closes), len(highs), len(lows), len(volumes))
+            if min_len == 0:
+                continue
 
-        start_idx = min_len - lookback_hours - forward_horizon
-        end_idx = min_len - forward_horizon
+            historical_data[pair] = [
+                {
+                    "close": float(closes[i]),
+                    "high": float(highs[i]),
+                    "low": float(lows[i]),
+                    "volume": float(volumes[i]),
+                }
+                for i in range(min_len)
+            ]
+        return historical_data
 
-        for t in range(start_idx, end_idx, 6):  # Sample every 6h to reduce noise
-            raw_features = {}
-            for pair in self.active_pairs:
-                closes = self.binance.get_closes(pair)[:t+1]
-                if len(closes) < 100: continue
-                highs = self.binance.get_highs(pair)[:t+1]
-                lows = self.binance.get_lows(pair)[:t+1]
-                volumes = self.binance.get_volumes(pair)[:t+1]
-                
-                # Approximate bid/ask with close for historical training
-                curr_px = closes[-1]
-                feats = compute_coin_features(closes, highs, lows, volumes, curr_px, curr_px)
-                if feats:
-                    raw_features[pair] = feats
+    def _refresh_ridge_model(self, lookback_hours: int = 400, forward_horizon: int = 24):
+        """Train Ridge via RidgeTrainer and hot-swap it into the ranker."""
+        historical_data = self._build_historical_data_for_ml()
+        model, feature_cols = self.ridge_trainer.train(
+            historical_data=historical_data,
+            lookback=lookback_hours,
+            forward_horizon=forward_horizon,
+            feature_cols=self.ranker.ridge_features,
+        )
 
-            zscored = zscore_universe(raw_features)
-            
-            for pair, f_z in zscored.items():
-                curr_close = self.binance.get_closes(pair)[t]
-                future_close = self.binance.get_closes(pair)[t + forward_horizon]
-                target_return = (future_close - curr_close) / curr_close
-                
-                # Build X vector strictly based on ranking.py's expected keys
-                X_train.append([f_z.get(k, 0.0) for k in features_to_use])
-                y_train.append(target_return)
+        if model is None:
+            log.warning("Ridge model training skipped or failed; keeping current ranker mode.")
+            return
 
-        if len(X_train) > 50:
-            model = RidgeCV(alphas=np.logspace(-3, 1, 100))
-            model.fit(X_train, y_train)
-            self.ranker.set_ridge_model(model)
-            log.info(f"Ridge model trained on {len(X_train)} samples & passed to Ranker.")
-        
+        if feature_cols and feature_cols != self.ranker.ridge_features:
+            log.warning("Ridge feature order mismatch detected; keeping ranker feature order.")
+
+        self.ranker.set_ridge_model(model)
+        log.info("Ridge model refreshed and passed to Ranker.")
+
     # ─── Startup ────────────────────────────────────────────────
 
     def load_historical_data(self):
@@ -287,7 +272,7 @@ class TradingBot:
         # ══════════════════════════════════════════════════════════════
         if self.cycle_count % 24 == 1:  # Train once a day
             try:
-                self._train_ridge_model()
+                self._refresh_ridge_model()
             except Exception as e:
                 log.error(f"ML Training failed: {e}")
         # ══════════════════════════════════════════════════════════════
@@ -338,20 +323,7 @@ class TradingBot:
             self.regime.fit_hmm(pc1_series)
 
         self.risk_mgr.set_regime_multiplier(self.regime.get_exposure_multiplier())
-        fill_events = self.executor.manage_pending_orders()
-        for evt in fill_events:
-            pair = evt["pair"]
-            qty = evt["filled_qty"]
-            side = evt["side"]
-            px = evt["filled_avg_price"]
-
-            if side == "BUY" and qty > 0:
-                self.positions[pair] = self.positions.get(pair, 0) + qty
-                self.risk_mgr.update_trailing_stop(
-                    pair, px, strategy="breakout", entry_price=px
-                )
-            elif side == "SELL" and qty > 0:
-                self.positions[pair] = max(0.0, self.positions.get(pair, 0) - qty)
+        self.executor.manage_pending_orders()
 
         if not self.regime.should_trade():
             log.info(f"REGIME HOSTILE — no new entries. Regime: {self.regime.get_status()['regime']}")
@@ -562,30 +534,35 @@ class TradingBot:
         })
 
     def run(self):
+        global _running
+
         log.info("=" * 60)
-        log.info("TRADING BOT v5 STARTING")
+        log.info("TRADING BOT v4 STARTING")
         log.info(f"Poll interval: {POLL_INTERVAL_SECONDS}s")
         log.info(f"Active pairs: {len(self.active_pairs)}")
+        log.info(f"Pipeline: regime → events → valid trades → ranking → execution")
+        log.info(f"Regime: rule-based + HMM | Signals: continuation + reversal")
+        log.info(f"Ranking: hand-built score (ridge-ready)")
         log.info("=" * 60)
 
         self.load_historical_data()
 
         while _running:
             try:
+                log.info(f"About to run cycle {self.cycle_count + 1}")
                 self.run_cycle()
+                log.info(f"Finished cycle {self.cycle_count}")
             except Exception as e:
-                log.error(f"Fatal error in cycle: {e}")
-                log.error(traceback.format_exc())
+                log.error(f"Cycle error: {e}\n{traceback.format_exc()}")
 
-            # wake up at the next top-of-hour + 5s
-            wake_ts = _next_hour_boundary(delay_seconds=5)
-            log.info(
-                f"Sleeping until next hour boundary: "
-                f"{datetime.fromtimestamp(wake_ts, tz=timezone.utc).isoformat()}"
-            )
-            _sleep_until(wake_ts)
+            next_cycle = time.time() + POLL_INTERVAL_SECONDS
+            while _running and time.time() < next_cycle:
+                time.sleep(1)
 
-        log.info("Bot stopped cleanly.")
+        log.info("Bot shutting down.")
+        metrics = self.perf.summary()
+        log.info(f"FINAL METRICS: {metrics}")
+
 
 def main():
     bot = TradingBot()

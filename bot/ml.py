@@ -16,14 +16,14 @@ class RidgeTrainer:
     def __init__(self, active_pairs):
         self.active_pairs = active_pairs
 
-    def train(self, historical_data: dict, lookback=400, forward_horizon=24):
+    def train(self, historical_data: dict, lookback=400, forward_horizon=24, feature_cols=None):
         if not SKLEARN_AVAILABLE:
             return None, None
 
         log.info(f"Training Ridge ML Model (Lookback: {lookback}h, Target: +{forward_horizon}h)...")
         
         X_train, y_train = [], []
-        feature_cols = None
+        feature_cols = list(feature_cols) if feature_cols is not None else None
         
         # Ensure we have enough data
         min_len = min((len(historical_data[p]) for p in self.active_pairs if p in historical_data), default=0)
@@ -53,11 +53,10 @@ class RidgeTrainer:
             
             for pair, f_z in zscored.items():
                 if feature_cols is None:
-                    # Capture valid float features to map exactly to ranking.py expectations
                     feature_cols = [k for k, v in f_z.items() if isinstance(v, float) and not k.startswith('_')]
-                    
+
                 target_return = (historical_data[pair][t + forward_horizon]["close"] - historical_data[pair][t]["close"]) / historical_data[pair][t]["close"]
-                
+
                 X_train.append([f_z.get(k, 0.0) for k in feature_cols])
                 y_train.append(target_return)
                 
