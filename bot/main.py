@@ -1,11 +1,10 @@
 """
-Main trading bot loop v4: integrated pipeline.
+Main trading bot loop v5: integrated pipeline.
 
-Architecture (maps to teammate's 5-step brief):
+Architecture:
 
   Step 1 — REGIME FILTER: Should we trade at all?
-    Cross-sectional market features (breadth, trend strength, stress)
-    + HMM on BTC. Sets exposure budget. Can disable all new longs.
+    HMM on Principal component 1.
 
   Step 2 — EVENT FILTER: Any valid setups?
     Continuation (volume-confirmed breakout with clean path)
@@ -31,12 +30,12 @@ import signal
 import traceback
 import numpy as np
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from bot.config import (
     POLL_INTERVAL_SECONDS, TRADEABLE_COINS,
-    MAX_TOTAL_EXPOSURE_PCT, USE_LIMIT_ORDERS, BREAKOUT_LOOKBACK,
-    MAX_POSITIONS,
+    MAX_TOTAL_EXPOSURE_PCT, USE_LIMIT_ORDERS, BREAKOUT_LOOKBACK, 
+    MAX_POSITIONS
 )
 from bot.roostoo_client import RoostooClient
 from bot.binance_data import BinanceData
@@ -65,16 +64,32 @@ signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
 
 
-CONTINUATION_SCORE_THRESHOLD = 0.12
-REVERSAL_SCORE_THRESHOLD = 0.17
+CONTINUATION_SOFT_FLOOR = 0.0010
+REVERSAL_SOFT_FLOOR = 0.0020
 
+TOP_K_CONTINUATION = 2
+TOP_K_REVERSAL = 1
+
+
+def _next_hour_boundary(delay_seconds: int = 5) -> float:
+    now = datetime.now(timezone.utc)
+    next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    return (next_hour + timedelta(seconds=delay_seconds)).timestamp()
+
+def _sleep_until(ts: float):
+    global _running
+    while _running:
+        remaining = ts - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(1.0, remaining))
 
 class TradingBot:
     """Main trading bot orchestrator — v4 integrated pipeline."""
 
     def __init__(self):
         log.info("=" * 60)
-        log.info("INITIALIZING TRADING BOT v4 (integrated pipeline)")
+        log.info("INITIALIZING TRADING BOT v5 (integrated pipeline)")
         log.info("=" * 60)
 
         # ── Core infrastructure ──
@@ -381,35 +396,59 @@ class TradingBot:
         # ══════════════════════════════════════════════════════
         # STEP 4: RANKING — Which are best?
         # ══════════════════════════════════════════════════════
-        ranked = self.ranker.rank(valid_candidates, max_results=MAX_POSITIONS)
+        ranked = self.ranker.rank(valid_candidates, max_results=len(valid_candidates))
 
         # ══════════════════════════════════════════════════════
         # STEP 5: EXECUTION — Size, enter, manage, exit
+        # top-k per sleeve + soft floors
         # ══════════════════════════════════════════════════════
         self._check_exits(ticker_data, dd_check)
 
         total_exposure = self._get_total_exposure_usd(ticker_data)
         num_positions = sum(1 for q in self.positions.values() if q > 0)
 
-        for pair, score, features in ranked:
-            if num_positions >= MAX_POSITIONS:
-                break
+        continuation_candidates = []
+        reversal_candidates = []
 
-            # Keep both sleeves live, but make reversals earn their spot.
+        for pair, score, features in ranked:
             sig = features.get("_signal", {})
             strategy = sig.get("strategy", "none")
-            
-            if strategy == "continuation" and score < CONTINUATION_SCORE_THRESHOLD:
-                log.info(
-                    f"Skipping {pair}: score {score:.3f} below continuation threshold "
-                    f"({CONTINUATION_SCORE_THRESHOLD:.2f})"
-                )
-                continue
-            if strategy == "reversal" and score < REVERSAL_SCORE_THRESHOLD:
-                log.info(
-                    f"Skipping {pair}: score {score:.3f} below reversal threshold "
-                    f"({REVERSAL_SCORE_THRESHOLD:.2f})"
-                )
+
+            if strategy == "continuation":
+                if score >= CONTINUATION_SOFT_FLOOR:
+                    continuation_candidates.append((pair, score, features))
+                else:
+                    log.info(
+                        f"Skipping {pair}: score {score:.4f} below continuation floor "
+                        f"({CONTINUATION_SOFT_FLOOR:.4f})"
+                    )
+
+            elif strategy == "reversal":
+                if score >= REVERSAL_SOFT_FLOOR:
+                    reversal_candidates.append((pair, score, features))
+                else:
+                    log.info(
+                        f"Skipping {pair}: score {score:.4f} below reversal floor "
+                        f"({REVERSAL_SOFT_FLOOR:.4f})"
+                    )
+
+        # ranked is already sorted, but sort again explicitly for safety
+        continuation_candidates.sort(key=lambda x: x[1], reverse=True)
+        reversal_candidates.sort(key=lambda x: x[1], reverse=True)
+
+        top_continuations = continuation_candidates[:TOP_K_CONTINUATION]
+        top_reversals = reversal_candidates[:TOP_K_REVERSAL]
+
+        # 2. Combine them
+        selected = top_continuations + top_reversals
+
+        # 3. CRITICAL: Re-sort the combined pool so the absolute highest scores get capital first
+        selected.sort(key=lambda x: x[1], reverse=True)
+
+        for pair, score, features in selected:
+            if num_positions >= MAX_POSITIONS:
+                break
+            if self.positions.get(pair, 0) > 0:
                 continue
 
             sig = features.get("_signal", {})
@@ -431,7 +470,7 @@ class TradingBot:
 
             log.info(
                 f"BUY [{sig.get('strategy', '?')}]: {pair} "
-                f"rank_score={score:.3f} strength={sig.get('strength', 0):.2f} "
+                f"rank_score={score:.4f} strength={sig.get('strength', 0):.2f} "
                 f"regime={self.regime.get_status()['regime']} "
                 f"size=${size_usd:,.0f}"
             )
@@ -557,8 +596,8 @@ class TradingBot:
         log.info(f"Poll interval: {POLL_INTERVAL_SECONDS}s")
         log.info(f"Active pairs: {len(self.active_pairs)}")
         log.info(f"Pipeline: regime → events → valid trades → ranking → execution")
-        log.info(f"Regime: rule-based + HMM | Signals: continuation + reversal")
-        log.info(f"Ranking: hand-built score (ridge-ready)")
+        log.info(f"Regime:HMM on PCA | Signals: continuation + reversal")
+        log.info(f"Ranking: Ridge CV")
         log.info("=" * 60)
 
         self.load_historical_data()
@@ -571,9 +610,8 @@ class TradingBot:
             except Exception as e:
                 log.error(f"Cycle error: {e}\n{traceback.format_exc()}")
 
-            next_cycle = time.time() + POLL_INTERVAL_SECONDS
-            while _running and time.time() < next_cycle:
-                time.sleep(1)
+            wake_ts = _next_hour_boundary(delay_seconds=5)
+            _sleep_until(wake_ts)
 
         log.info("Bot shutting down.")
         metrics = self.perf.summary()
