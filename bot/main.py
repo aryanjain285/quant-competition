@@ -65,8 +65,8 @@ signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
 
 
-CONTINUATION_SCORE_THRESHOLD = 0.15
-REVERSAL_SCORE_THRESHOLD = 0.20
+CONTINUATION_SCORE_THRESHOLD = 0.12
+REVERSAL_SCORE_THRESHOLD = 0.17
 
 
 class TradingBot:

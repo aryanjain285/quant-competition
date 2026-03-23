@@ -48,17 +48,17 @@ def check_continuation(features: dict, zscored: dict) -> dict:
     result["reasons"].append("r24h_positive")
 
     # 3. Persistence high (move is internally consistent)
-    if features.get("persistence", 0.5) < 0.47:
+    if features.get("persistence", 0.5) < 0.45:
         return result
     result["reasons"].append("persistent")
 
     # 4. Choppiness low (path is clean)
-    if features.get("choppiness", 0.5) > 0.88:
+    if features.get("choppiness", 0.5) > 0.90:
         return result
     result["reasons"].append("clean_path")
 
     # 5. Volume confirmed (mandatory — v3 proven)
-    if features.get("volume_ratio", 1.0) < 1.05:
+    if features.get("volume_ratio", 1.0) < 1.00:
         return result
     result["reasons"].append("volume")
 
@@ -97,7 +97,7 @@ def check_reversal(features: dict, zscored: dict) -> dict:
 
     # Overshoot must be extreme (large negative z-score = unusually large drop)
     overshoot = features.get("overshoot", 0)
-    if overshoot > -1.3:
+    if overshoot > -1.1:
         # Not oversold enough — overshoot is negative for drops
         return result
     result["reasons"].append(f"oversold(z={overshoot:.1f})")
@@ -184,7 +184,7 @@ def compute_signal(
         "down_vol": raw_features.get("downside_vol", 0),
         "spread": raw_features.get("spread_pct", 0),
         "breakout_strength": raw_features.get("breakout_distance", 0),
-        "volume_confirm": raw_features.get("volume_ratio", 1.0) > 1.05,
+        "volume_confirm": raw_features.get("volume_ratio", 1.0) > 1.00,
     }
 
     # Check continuation (trend-following)
