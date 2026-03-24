@@ -67,8 +67,8 @@ signal.signal(signal.SIGTERM, _shutdown)
 CONTINUATION_SOFT_FLOOR = 0.0010
 REVERSAL_SOFT_FLOOR = 0.0015
 
-TOP_K_CONTINUATION = 2
-TOP_K_REVERSAL = 1
+TOP_K_CONTINUATION = 3
+TOP_K_REVERSAL = 2
 
 
 def _next_hour_boundary(delay_seconds: int = 5) -> float:
@@ -85,7 +85,7 @@ def _sleep_until(ts: float):
         time.sleep(min(1.0, remaining))
 
 class TradingBot:
-    """Main trading bot orchestrator — v4 integrated pipeline."""
+    """Main trading bot orchestrator — v5 integrated pipeline."""
 
     def __init__(self):
         log.info("=" * 60)
@@ -285,7 +285,7 @@ class TradingBot:
         # LIVE MACHINE LEARNING INJECTION
         # Train the model every 6 hours (cycle 1, 7, 13...) to keep it fresh
         # ══════════════════════════════════════════════════════════════
-        if self.cycle_count % 24 == 1:  # Train once a day
+        if self.cycle_count % 6 == 1:  # train once every 6 hours.
             try:
                 self._refresh_ridge_model()
             except Exception as e:
@@ -332,10 +332,10 @@ class TradingBot:
             pc1_series = pc1_result[0]
 
         # Update regime (PCA-HMM only)
-        self.regime.update(pc1_series=pc1_series)
-
         if self.cycle_count % self.regime_refit_interval == 0 and pc1_series is not None:
             self.regime.fit_hmm(pc1_series)
+
+        self.regime.update(pc1_series=pc1_series)
 
         self.risk_mgr.set_regime_multiplier(self.regime.get_exposure_multiplier())
 
@@ -389,6 +389,11 @@ class TradingBot:
                 valid_candidates[pair]["_signal"] = sig
 
         if not valid_candidates:
+            log.info(
+                f"CAN TRADE, BUT NO VALID CANDIDATES | "
+                f"Raw signals: {len(signals)} | "
+                f"Regime: {self.regime.get_status()['regime']}"
+            )
             self._check_exits(ticker_data, dd_check)
             self._log_cycle(ticker_data, portfolio_value, all_raw_features, signals, dd_check)
             return
@@ -511,16 +516,6 @@ class TradingBot:
         # ══════════════════════════════════════════════════════
         self._log_cycle(ticker_data, portfolio_value, all_raw_features, signals, dd_check)
 
-        if self.cycle_count % 1 == 0:  
-            metrics = self.perf.summary()
-            log.info(
-                f"HOURLY | Ret: {metrics['total_return_pct']:.2f}% | "
-                f"DD: {metrics['max_drawdown_pct']:.2f}% | "
-                f"Sharpe: {metrics['sharpe']:.2f} | Sort: {metrics['sortino']:.2f} | "
-                f"Calm: {metrics['calmar']:.2f} | Comp: {metrics['composite']:.2f} | "
-                f"Pos: {num_positions} | Exp: ${total_exposure:,.0f} | "
-                f"Regime: {self.regime.get_status()['regime']}"
-            )
 
         elapsed = time.time() - cycle_start
         log.debug(f"Cycle {self.cycle_count} in {elapsed:.2f}s")
@@ -570,6 +565,10 @@ class TradingBot:
         self.positions.clear()
 
     def _log_cycle(self, ticker_data, portfolio_value, raw_feats, signals, dd_check):
+        metrics = self.perf.summary()
+        num_positions = sum(1 for q in self.positions.values() if q > 0)
+        total_exposure = self._get_total_exposure_usd(ticker_data)
+
         log_cycle({
             "cycle": self.cycle_count,
             "portfolio_value": round(portfolio_value, 2),
@@ -585,14 +584,23 @@ class TradingBot:
             #"sentiment": self.sentiment.get_status(),
             "risk": self.risk_mgr.get_status(),
             "drawdown_action": dd_check.get("action", "none"),
-            "metrics": self.perf.summary(),
+            "metrics": metrics,
         })
+
+        log.info(
+            f"HOURLY | Ret: {metrics['total_return_pct']:.2f}% | "
+            f"DD: {metrics['max_drawdown_pct']:.2f}% | "
+            f"Sharpe: {metrics['sharpe']:.2f} | Sort: {metrics['sortino']:.2f} | "
+            f"Calm: {metrics['calmar']:.2f} | Comp: {metrics['composite']:.2f} | "
+            f"Pos: {num_positions} | Exp: ${total_exposure:,.0f} | "
+            f"Regime: {self.regime.get_status()['regime']}"
+        )
 
     def run(self):
         global _running
 
         log.info("=" * 60)
-        log.info("TRADING BOT v4 STARTING")
+        log.info("TRADING BOT v5 STARTING")
         log.info(f"Poll interval: {POLL_INTERVAL_SECONDS}s")
         log.info(f"Active pairs: {len(self.active_pairs)}")
         log.info(f"Pipeline: regime → events → valid trades → ranking → execution")
