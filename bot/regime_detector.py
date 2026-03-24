@@ -27,28 +27,29 @@ except ImportError:
     PCA_AVAILABLE = False
 
 # Regime states
-TREND_SUPPORTIVE = 0
-SELECTIVE = 1
-HOSTILE = 2
-REGIME_NAMES = {0: "TREND_SUPPORTIVE", 1: "SELECTIVE", 2: "HOSTILE"}
+LOW_VOL = 0
+MID_VOL = 1
+HI_VOL = 2
+REGIME_NAMES = {0: "LOW_VOL", 1: "MID_VOL", 2: "HI_VOL"}
 
 EXPOSURE_MULTIPLIERS = {
-    TREND_SUPPORTIVE: 1.0,
-    SELECTIVE: 0.5,
-    HOSTILE: 0.1,
+    LOW_VOL: 0.5,
+    MID_VOL: 1.0,
+    HI_VOL: 0.0,
 }
 
 class RegimeDetector:
     """Detects market regime from PCA-HMM."""
 
     def __init__(self):
-        self.current_regime = SELECTIVE
+        self.current_regime = MID_VOL
         self.regime_confidence = 0.5
 
         # HMM
         self.hmm_model: Optional[GaussianHMM] = None
         self.hmm_fitted = False
         self._hmm_state_map = {}
+        self.hmm_regime = MID_VOL
 
         # PCA cache — avoid recomputing every cycle
         self._pca_loadings: Optional[np.ndarray] = None
@@ -58,7 +59,7 @@ class RegimeDetector:
         self._pca_last_fit: float = 0.0
         self._pca_refit_interval: float = 6 * 3600
         self._pc1_series: Optional[np.ndarray] = None
-
+        
     def compute_pc1_market_proxy(self, price_matrix: np.ndarray) -> tuple:
         if not PCA_AVAILABLE:
             return None, None, 0.0, None
@@ -137,7 +138,7 @@ class RegimeDetector:
             return
 
         try:
-            # 1. Change to 3 states to capture Extreme/Hostile environments
+            # 1. Change to 3 states to capture Extreme/HI_VOL environments
             self.hmm_model = GaussianHMM(
                 n_components=3, covariance_type="full",
                 n_iter=300, random_state=70,
@@ -153,13 +154,13 @@ class RegimeDetector:
 
             # 4. Map the sorted clusters to your 3 regimes
             self._hmm_state_map = {
-                sorted_state_ids[0]: TREND_SUPPORTIVE,  # Lowest vol   -> 1.00x exposure
-                sorted_state_ids[1]: SELECTIVE,         # Middle vol   -> 0.75x exposure
-                sorted_state_ids[2]: HOSTILE            # Highest vol  -> 0.25x exposure
+                sorted_state_ids[0]: LOW_VOL,  # Lowest vol   
+                sorted_state_ids[1]: MID_VOL,         # Middle vol  
+                sorted_state_ids[2]: HI_VOL            # Highest vol  - Choose not to trade in this regime. 
             }
 
             states = self.hmm_model.predict(features)
-            self.hmm_regime = self._hmm_state_map.get(states[-1], SELECTIVE)
+            self.hmm_regime = self._hmm_state_map.get(states[-1], MID_VOL)
             self.hmm_fitted = True
             log.info(f"HMM fitted on PC1: state={REGIME_NAMES[self.hmm_regime]}")
             
@@ -182,7 +183,7 @@ class RegimeDetector:
             features = np.column_stack([log_returns[-5:], [rolling_vol] * 5])
             if np.all(np.isfinite(features)):
                 states = self.hmm_model.predict(features)
-                self.hmm_regime = self._hmm_state_map.get(states[-1], SELECTIVE)
+                self.hmm_regime = self._hmm_state_map.get(states[-1], MID_VOL)
         except Exception:
             pass
 
@@ -195,14 +196,14 @@ class RegimeDetector:
             self.current_regime = self.hmm_regime
             self.regime_confidence = 1.0
         else:
-            self.current_regime = SELECTIVE
+            self.current_regime = MID_VOL
             self.regime_confidence = 0.0
 
     def get_exposure_multiplier(self) -> float:
         return EXPOSURE_MULTIPLIERS.get(self.current_regime, 0.6)
 
     def should_trade(self) -> bool:
-        return self.current_regime != HOSTILE
+        return self.current_regime != HI_VOL
 
     def get_status(self) -> dict:
         return {

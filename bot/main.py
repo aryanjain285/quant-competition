@@ -140,7 +140,7 @@ class TradingBot:
         self._sync_positions_from_wallet(wallet)
 
         self.cycle_count = 0
-        self.regime_refit_interval = 24   # every 24 cycles = 24 hours
+        self.regime_refit_interval = 12   # refit every 12 hours 
 
     # ─── Helpers ────────────────────────────────────────────────
 
