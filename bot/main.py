@@ -455,9 +455,9 @@ class TradingBot:
             rank_mult = 1.0
             if regime_name == "MID_VOL":
                 if idx == 0:
-                    rank_mult = 1.30
+                    rank_mult = 1.5
                 elif idx == 1:
-                    rank_mult = 1.10
+                    rank_mult = 1.25
                 elif idx == len(selected) - 1: 
                     rank_mult = 0.75
 

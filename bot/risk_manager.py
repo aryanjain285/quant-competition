@@ -137,7 +137,7 @@ class RiskManager:
 
         portfolio = self.current_value
 
-        # Effective max exposure adjusted by regime + sentiment
+        # Effective max exposure adjusted by regime
         effective_exposure = (
             MAX_TOTAL_EXPOSURE_PCT
             * self.regime_exposure_mult
@@ -165,7 +165,7 @@ class RiskManager:
         size *= self._redd_multiplier()
 
         # Signal strength scaling
-        size *= np.clip(signal_strength, 0.3, 1.0)
+        size *= np.clip(signal_strength, 0.2, 1.3)
 
         # Top Ranked Trade Scaling 
         size *= rank_multiplier
