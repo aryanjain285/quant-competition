@@ -16,8 +16,7 @@ Architecture:
     If empty → hold cash. No forced trades.
 
   Step 4 — RANKING: Which are best?
-    Cross-sectional score: weighted sum of z-scored features.
-    Top N selected for execution. Ready for ridge drop-in.
+    Cross-sectional score: Using Ridge CV for ranking. 
 
   Step 5 — EXECUTION: Size, enter, manage, exit.
     Vol-parity × REDD × regime multiplier.
@@ -261,9 +260,7 @@ class TradingBot:
         self.cycle_count += 1
         cycle_start = time.time()
 
-        # ══════════════════════════════════════════════════════
         # STEP 0: Fetch fresh data
-        # ══════════════════════════════════════════════════════
         ticker_data = self.client.ticker()
         if not ticker_data:
             log.warning("Failed to fetch ticker, skipping cycle")
@@ -281,16 +278,13 @@ class TradingBot:
         self.risk_mgr.update_portfolio_value(portfolio_value)
         self.perf.record(portfolio_value)
 
-        # ══════════════════════════════════════════════════════════════
         # LIVE MACHINE LEARNING INJECTION
-        # Train the model every 6 hours (cycle 1, 7, 13...) to keep it fresh
-        # ══════════════════════════════════════════════════════════════
-        if self.cycle_count % 6 == 1:  # train once every 6 hours.
+        # Train the model every 6 hours (cycle 1, 7, 13, ...) to keep it fresh
+        if self.cycle_count % 6 == 1:
             try:
                 self._refresh_ridge_model()
             except Exception as e:
                 log.error(f"ML Training failed: {e}")
-        # ══════════════════════════════════════════════════════════════
 
         # Drawdown breakers (emergency only)
         dd_check = self.risk_mgr.check_drawdown_breakers()
@@ -301,21 +295,22 @@ class TradingBot:
             return
 
         if self.risk_mgr.is_paused:
-            log.info(f"Trading paused. Resume in {self.risk_mgr.get_status()['pause_remaining_min']:.0f} min")
+            pause_min = self.risk_mgr.get_status()["pause_remaining_min"]
+            log.info(f"Trading paused. Resume in {pause_min:.0f} min")
             self._log_cycle(ticker_data, portfolio_value, {}, {}, dd_check)
             return
 
-        # ══════════════════════════════════════════════════════
-        # STEP 1: REGIME FILTER — Should we trade at all?
-        # ══════════════════════════════════════════════════════
+        # STEP 1: REGIME FILTER
         all_raw_features = {}
         for pair in self.active_pairs:
             closes = self.binance.get_closes(pair)
             highs = self.binance.get_highs(pair)
             lows = self.binance.get_lows(pair)
             volumes = self.binance.get_volumes(pair)
+
             if len(closes) < 100:
                 continue
+
             tick = ticker_data.get(pair, {})
             bid = tick.get("MaxBid", 0)
             ask = tick.get("MinAsk", 0)
@@ -324,19 +319,17 @@ class TradingBot:
             if feats:
                 all_raw_features[pair] = feats
 
-        # PCA market proxy → regime detection
         price_matrix = self._build_price_matrix()
         pc1_series = None
         if price_matrix is not None:
             pc1_result = self.regime.compute_pc1_market_proxy(price_matrix)
             pc1_series = pc1_result[0]
 
-        # Update regime (PCA-HMM only)
+        # Refit first, then update so the new model is used immediately on refit cycles
         if self.cycle_count % self.regime_refit_interval == 0 and pc1_series is not None:
             self.regime.fit_hmm(pc1_series)
 
         self.regime.update(pc1_series=pc1_series)
-
         self.risk_mgr.set_regime_multiplier(self.regime.get_exposure_multiplier())
 
         # Process pending limit orders — capture fills to update positions
@@ -344,27 +337,31 @@ class TradingBot:
         for fill in fill_events:
             pair = fill["pair"]
             filled_qty = fill["filled_qty"]
+
             if fill["side"] == "BUY" and filled_qty > 0:
                 self.positions[pair] = self.positions.get(pair, 0) + filled_qty
                 self.risk_mgr.update_trailing_stop(
-                    pair, fill["filled_avg_price"],
+                    pair,
+                    fill["filled_avg_price"],
                     strategy="breakout",
                     entry_price=fill["filled_avg_price"],
                 )
-                log.info(f"PENDING FILL [BUY]: {pair} qty={filled_qty:.6f} @ {fill['filled_avg_price']:.2f}")
+                log.info(
+                    f"PENDING FILL [BUY]: {pair} qty={filled_qty:.6f} "
+                    f"@ {fill['filled_avg_price']:.2f}"
+                )
             elif fill["side"] == "SELL" and filled_qty > 0:
                 self.positions[pair] = max(0, self.positions.get(pair, 0) - filled_qty)
                 log.info(f"PENDING FILL [SELL]: {pair} qty={filled_qty:.6f}")
 
+        regime_name = self.regime.get_status()["regime"]
         if not self.regime.should_trade():
-            log.info(f"REGIME HOSTILE — no new entries. Regime: {self.regime.get_status()['regime']}")
+            log.info(f"REGIME HOSTILE — no new entries. Regime: {regime_name}")
             self._check_exits(ticker_data, dd_check)
             self._log_cycle(ticker_data, portfolio_value, all_raw_features, {}, dd_check)
             return
 
-        # ══════════════════════════════════════════════════════
-        # STEP 2: EVENT FILTER — Any valid setups?
-        # ══════════════════════════════════════════════════════
+        # STEP 2: EVENT FILTER
         all_zscored = zscore_universe(all_raw_features)
         for pair in all_zscored:
             compute_submodel_scores(all_zscored[pair])
@@ -373,15 +370,15 @@ class TradingBot:
         for pair in all_raw_features:
             closes = self.binance.get_closes(pair)
             lows = self.binance.get_lows(pair)
-
             signals[pair] = compute_signal(
-                all_raw_features[pair], all_zscored[pair],
-                closes, lows, BREAKOUT_LOOKBACK,
+                all_raw_features[pair],
+                all_zscored[pair],
+                closes,
+                lows,
+                BREAKOUT_LOOKBACK,
             )
 
-        # ══════════════════════════════════════════════════════
         # STEP 3: VALID TRADES — Collect survivors
-        # ══════════════════════════════════════════════════════
         valid_candidates = {}
         for pair, sig in signals.items():
             if sig["action"] == "BUY" and self.positions.get(pair, 0) <= 0:
@@ -391,22 +388,16 @@ class TradingBot:
         if not valid_candidates:
             log.info(
                 f"CAN TRADE, BUT NO VALID CANDIDATES | "
-                f"Raw signals: {len(signals)} | "
-                f"Regime: {self.regime.get_status()['regime']}"
+                f"Raw signals: {len(signals)} | Regime: {regime_name}"
             )
             self._check_exits(ticker_data, dd_check)
             self._log_cycle(ticker_data, portfolio_value, all_raw_features, signals, dd_check)
             return
 
-        # ══════════════════════════════════════════════════════
-        # STEP 4: RANKING — Which are best?
-        # ══════════════════════════════════════════════════════
+        # STEP 4: RANKING
         ranked = self.ranker.rank(valid_candidates, max_results=len(valid_candidates))
 
-        # ══════════════════════════════════════════════════════
         # STEP 5: EXECUTION — Size, enter, manage, exit
-        # top-k per sleeve + soft floors
-        # ══════════════════════════════════════════════════════
         self._check_exits(ticker_data, dd_check)
 
         total_exposure = self._get_total_exposure_usd(ticker_data)
@@ -427,7 +418,6 @@ class TradingBot:
                         f"Skipping {pair}: score {score:.4f} below continuation floor "
                         f"({CONTINUATION_SOFT_FLOOR:.4f})"
                     )
-
             elif strategy == "reversal":
                 if score >= REVERSAL_SOFT_FLOOR:
                     reversal_candidates.append((pair, score, features))
@@ -437,20 +427,16 @@ class TradingBot:
                         f"({REVERSAL_SOFT_FLOOR:.4f})"
                     )
 
-        # ranked is already sorted, but sort again explicitly for safety
         continuation_candidates.sort(key=lambda x: x[1], reverse=True)
         reversal_candidates.sort(key=lambda x: x[1], reverse=True)
 
         top_continuations = continuation_candidates[:TOP_K_CONTINUATION]
         top_reversals = reversal_candidates[:TOP_K_REVERSAL]
 
-        # 2. Combine them
         selected = top_continuations + top_reversals
-
-        # 3. CRITICAL: Re-sort the combined pool so the absolute highest scores get capital first
         selected.sort(key=lambda x: x[1], reverse=True)
 
-        for pair, score, features in selected:
+        for idx, (pair, score, features) in enumerate(selected):
             if num_positions >= MAX_POSITIONS:
                 break
             if self.positions.get(pair, 0) > 0:
@@ -466,9 +452,22 @@ class TradingBot:
 
             real_vol = all_raw_features.get(pair, {}).get("realized_vol", 0.5)
 
+            rank_mult = 1.0
+            if regime_name == "MID_VOL":
+                if idx == 0:
+                    rank_mult = 1.30
+                elif idx == 1:
+                    rank_mult = 1.10
+                elif idx == len(selected) - 1: 
+                    rank_mult = 0.75
+
             size_usd = self.risk_mgr.position_size_usd(
-                pair, real_vol, total_exposure, num_positions,
-                signal_strength=sig.get("strength", 0.5)
+                pair,
+                real_vol,
+                total_exposure,
+                num_positions,
+                signal_strength=sig.get("strength", 0.5),
+                rank_multiplier=rank_mult,
             )
             if size_usd < 50:
                 continue
@@ -476,11 +475,17 @@ class TradingBot:
             log.info(
                 f"BUY [{sig.get('strategy', '?')}]: {pair} "
                 f"rank_score={score:.4f} strength={sig.get('strength', 0):.2f} "
-                f"regime={self.regime.get_status()['regime']} "
-                f"size=${size_usd:,.0f}"
+                f"regime={regime_name} size=${size_usd:,.0f}"
             )
 
-            result = self.executor.buy(pair, size_usd, price, bid, ask, use_limit=USE_LIMIT_ORDERS)
+            result = self.executor.buy(
+                pair,
+                size_usd,
+                price,
+                bid,
+                ask,
+                use_limit=USE_LIMIT_ORDERS,
+            )
             if result and result.get("Success"):
                 detail = result.get("OrderDetail", {})
                 filled_qty = detail.get("FilledQuantity", 0)
@@ -488,7 +493,8 @@ class TradingBot:
                     self.positions[pair] = self.positions.get(pair, 0) + filled_qty
                     strategy = sig.get("strategy", "continuation")
                     self.risk_mgr.update_trailing_stop(
-                        pair, price,
+                        pair,
+                        price,
                         strategy="mean_rev" if strategy == "reversal" else "breakout",
                         entry_price=detail.get("FilledAverPrice", price),
                     )
@@ -505,21 +511,18 @@ class TradingBot:
                 qty = self.positions[pair]
 
                 urgent = sig.get("breakdown", False)
-                log.info(f"SELL [{sig.get('strategy', '?')}]: {pair} qty={qty} "
-                         f"{'MARKET' if urgent else 'LIMIT'}")
+                log.info(
+                    f"SELL [{sig.get('strategy', '?')}]: {pair} qty={qty} "
+                    f"{'MARKET' if urgent else 'LIMIT'}"
+                )
                 self.executor.sell(pair, qty, price, bid, ask, use_limit=not urgent)
                 self.risk_mgr.clear_trailing_stop(pair)
                 self.positions[pair] = 0
 
-        # ══════════════════════════════════════════════════════
-        # LOGGING
-        # ══════════════════════════════════════════════════════
         self._log_cycle(ticker_data, portfolio_value, all_raw_features, signals, dd_check)
-
 
         elapsed = time.time() - cycle_start
         log.debug(f"Cycle {self.cycle_count} in {elapsed:.2f}s")
-
         
     # ─── Exit Management ─────────────────────────────────────
 
@@ -604,7 +607,7 @@ class TradingBot:
         log.info(f"Poll interval: {POLL_INTERVAL_SECONDS}s")
         log.info(f"Active pairs: {len(self.active_pairs)}")
         log.info(f"Pipeline: regime → events → valid trades → ranking → execution")
-        log.info(f"Regime:HMM on PCA | Signals: continuation + reversal")
+        log.info(f"Regime: HMM on PCA | Signals: continuation + reversal")
         log.info(f"Ranking: Ridge CV")
         log.info("=" * 60)
 

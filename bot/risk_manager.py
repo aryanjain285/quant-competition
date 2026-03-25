@@ -118,6 +118,7 @@ class RiskManager:
         current_exposure_usd: float,
         num_current_positions: int,
         signal_strength: float = 1.0,
+        rank_multiplier: float= 1.0
     ) -> float:
         """Calculate position size with REDD scaling and regime awareness.
 
@@ -165,6 +166,9 @@ class RiskManager:
 
         # Signal strength scaling
         size *= np.clip(signal_strength, 0.3, 1.0)
+
+        # Top Ranked Trade Scaling 
+        size *= rank_multiplier
 
         return max(0.0, size)
 
