@@ -29,8 +29,8 @@ from bot.backtest.sim_exchange import SimExchange, SimClock
 from bot.config import (
     BREAKOUT_LOOKBACK, MAX_POSITIONS, MAX_TOTAL_EXPOSURE_PCT,
     USE_LIMIT_ORDERS, LIMIT_ORDER_TIMEOUT_SECONDS, TRADEABLE_COINS,
-    LASSO_FEATURES, ENTRY_THRESHOLD,
-    ML_RETRAIN_INTERVAL, HMM_REFIT_INTERVAL_HOURS,
+    LASSO_FEATURES, MAX_NEW_ENTRIES_PER_CYCLE,
+    ML_ENABLED, ML_RETRAIN_INTERVAL, HMM_REFIT_INTERVAL_HOURS,
 )
 from bot.features import compute_coin_features, zscore_universe, check_breakdown
 from bot.ranking import Ranker
@@ -129,14 +129,15 @@ class BacktestEngine:
                 if pc_scores is not None and len(pc_scores) > 100:
                     regime.fit_hmm(pc_scores)
 
-            # Initial Lasso training
-            try:
-                hist = self._build_historical_data(start)
-                model, _ = lasso_trainer.train(hist)
-                if model is not None:
-                    ranker.set_model(model)
-            except Exception:
-                pass
+            # Initial Lasso training (optional boost)
+            if ML_ENABLED:
+                try:
+                    hist = self._build_historical_data(start)
+                    model, r2 = lasso_trainer.train(hist)
+                    if model is not None:
+                        ranker.set_lasso(model, r2)
+                except Exception:
+                    pass
 
             for t in range(start, end):
                 cycle_count += 1
@@ -156,13 +157,13 @@ class BacktestEngine:
                 perf.record(pv)
                 result.portfolio_history.append(pv)
 
-                # ── Lasso retrain (every ML_RETRAIN_INTERVAL cycles) ──
-                if cycle_count % ML_RETRAIN_INTERVAL == 1:
+                # ── Optional Lasso retrain ──
+                if ML_ENABLED and cycle_count % ML_RETRAIN_INTERVAL == 1:
                     try:
                         hist = self._build_historical_data(t)
-                        model, _ = lasso_trainer.train(hist)
+                        model, r2 = lasso_trainer.train(hist)
                         if model is not None:
-                            ranker.set_model(model)
+                            ranker.set_lasso(model, r2)
                     except Exception:
                         pass
 
@@ -245,16 +246,11 @@ class BacktestEngine:
                     if feats:
                         all_raw[pair] = feats
 
-                all_z = zscore_universe(all_raw, feature_keys=LASSO_FEATURES)
+                all_z = zscore_universe(all_raw)
 
-                # ── Step 3: Rank (Lasso) ──
-                if not ranker.has_model():
-                    self._check_exits(positions, ticker_data, risk_mgr, executor, result, t)
-                    continue
-
-                predictions = lasso_trainer.predict(all_z, LASSO_FEATURES)
+                # ── Step 3+4: Rank (momentum composite + gate) ──
                 held = {p for p, q in positions.items() if q > 0}
-                ranked = ranker.rank(all_z, predictions, held)
+                ranked = ranker.rank(all_raw, all_z, held)
 
                 # ── Step 6 (before entries): Exits ──
                 self._check_exits(positions, ticker_data, risk_mgr, executor, result, t)
@@ -278,7 +274,7 @@ class BacktestEngine:
                         result.trade_log.append({"bar": t, "pair": pair, "reason": "breakdown"})
                         result.total_trades += 1
 
-                # ── Steps 4+5: Gate + Enter + Size ──
+                # ── Steps 4+5: Enter + Size ──
                 if not ranked:
                     continue
 
@@ -287,9 +283,12 @@ class BacktestEngine:
                     for p, qty in positions.items()
                 )
                 num_pos = sum(1 for q in positions.values() if q > 0)
+                new_entries = 0
 
-                for idx, (pair, pred_return, features) in enumerate(ranked):
+                for idx, (pair, score, raw_feats) in enumerate(ranked):
                     if num_pos >= MAX_POSITIONS:
+                        break
+                    if new_entries >= MAX_NEW_ENTRIES_PER_CYCLE:
                         break
                     if positions.get(pair, 0) > 0:
                         continue
@@ -299,7 +298,7 @@ class BacktestEngine:
                     if price <= 0:
                         continue
 
-                    real_vol = all_raw.get(pair, {}).get("realized_vol", 0.5)
+                    real_vol = raw_feats.get("realized_vol", 0.5)
 
                     # Rank multiplier (matches main.py)
                     if idx == 0:
@@ -311,7 +310,7 @@ class BacktestEngine:
                     else:
                         rank_mult = 1.0
 
-                    signal_strength = min(1.3, max(0.3, pred_return * 100))
+                    signal_strength = min(1.3, max(0.3, 0.5 + score * 0.5))
 
                     size_usd = risk_mgr.position_size_usd(
                         pair, real_vol, total_exposure, num_pos,
@@ -337,9 +336,10 @@ class BacktestEngine:
                             )
                             total_exposure += size_usd
                             num_pos += 1
+                            new_entries += 1
                             result.trade_log.append({
                                 "bar": t, "pair": pair, "reason": "buy",
-                                "pred_return": pred_return, "size": size_usd,
+                                "score": score, "size": size_usd,
                             })
                             result.total_trades += 1
 
