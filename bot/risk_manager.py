@@ -1,20 +1,28 @@
 """
-Risk manager v2: position sizing, drawdown control, trailing stops.
+Risk manager v6: unified trailing stops, REDD scaling, regime-aware sizing.
 
-Upgrades over v1:
-- REDD (Rolling Economic Drawdown) scaling: dynamically reduces size as drawdown grows
-- Regime-aware exposure: accepts multiplier from regime detector
-- Sortino-optimized exits: tight downside stops, let upside run (no cap on breakout)
-- Strategy-specific trailing stops calibrated to backtest results
+Key changes from v2:
+- UNIFIED trailing stop policy (no strategy branching)
+- All stop parameters from config.py (single source of truth)
+- Exposure multipliers: LOW_VOL=1.0, MID_VOL=0.7, HI_VOL=0.0
+
+Stop design rationale (Sortino optimization):
+- Hard stop at -3.5%: caps downside, reduces Sortino denominator
+- Partial exit (50%) at +3%: locks in gains, creates asymmetric payoff
+- Trailing stop: 3.5% from high (4.5% after partial for house-money effect)
+- Time stop: 60h with <1% gain (opportunity cost recapture)
 """
 import time
 import numpy as np
 from typing import Optional
 from bot.config import (
     MAX_POSITION_PCT, MAX_TOTAL_EXPOSURE_PCT, TARGET_RISK_PER_TRADE,
-    MAX_POSITIONS, TRAILING_STOP_PCT,
+    MAX_POSITIONS,
+    HARD_STOP_PCT, PARTIAL_EXIT_PCT, PARTIAL_EXIT_FRACTION,
+    TRAILING_STOP_PCT, TRAILING_STOP_WIDE_PCT,
+    TIME_STOP_HOURS, TIME_STOP_MIN_GAIN,
     DRAWDOWN_LEVEL_1, DRAWDOWN_LEVEL_2, DRAWDOWN_LEVEL_3,
-    DRAWDOWN_PAUSE_HOURS,
+    DRAWDOWN_PAUSE_HOURS, REDD_MAX_DD,
 )
 from bot.logger import get_logger
 
@@ -22,23 +30,21 @@ log = get_logger("risk_manager")
 
 
 class RiskManager:
-    """Manages portfolio risk with REDD scaling and Sortino-optimized stops."""
+    """Manages portfolio risk with REDD scaling and unified trailing stops."""
 
     def __init__(self, initial_portfolio_value: float):
         self.initial_value = initial_portfolio_value
         self.peak_value = initial_portfolio_value
         self.current_value = initial_portfolio_value
 
-        # Trailing stops: pair -> {high, strategy, entry_price, entry_features}
+        # Trailing stops: pair -> {high, entry_price, entry_time, partial_taken}
         self.trailing_stops: dict[str, dict] = {}
 
-        # Drawdown pause: timestamp when trading can resume
+        # Drawdown pause
         self.pause_until: float = 0.0
-
-        # Current drawdown level active (0 = none)
         self.drawdown_level: int = 0
 
-        # External multipliers (set by regime detector, sentiment, etc.)
+        # External multiplier (set by regime detector)
         self.regime_exposure_mult: float = 1.0
 
     def update_portfolio_value(self, value: float):
@@ -47,9 +53,7 @@ class RiskManager:
             self.peak_value = value
 
     def set_regime_multiplier(self, mult: float):
-        """Set by regime detector each cycle."""
         self.regime_exposure_mult = np.clip(mult, 0.1, 1.0)
-
 
     @property
     def drawdown_from_peak(self) -> float:
@@ -64,46 +68,40 @@ class RiskManager:
     def _redd_multiplier(self) -> float:
         """Rolling Economic Drawdown scaling.
 
-        Smoothly reduces NEW position sizes as drawdown increases.
-        At 0% dd → 1.0x, at 8% dd → 0.0x.
-        This is the PRIMARY drawdown control mechanism.
-        Circuit breakers below are EMERGENCY-only for tail events.
+        Smoothly reduces NEW position sizes as drawdown grows.
+        At 0% DD → 1.0x. At REDD_MAX_DD → 0.0x. Linear interpolation.
+        This is the PRIMARY risk control — circuit breakers are emergency-only.
         """
         dd = self.drawdown_from_peak
-        max_dd_limit = 0.10  # at 10% DD new positions = zero (matches level 3 breaker)
         if dd <= 0:
             return 1.0
-        return max(0.0, 1.0 - (dd / max_dd_limit))
+        return max(0.0, 1.0 - (dd / REDD_MAX_DD))
 
     def check_drawdown_breakers(self) -> dict:
-        """Emergency breakers only. REDD handles normal drawdown smoothly.
+        """Emergency breakers. REDD handles normal drawdown smoothly.
 
-        Level 1: log warning only — REDD is already reducing sizing
-        Level 2: liquidate + short pause (actual emergency)
-        Level 3: liquidate + longer pause (catastrophic)
-
-        NO forced position reduction at level 1. Selling at the bottom
-        realizes losses and prevents recovery. REDD's smooth scaling
-        is strictly better than discrete cuts.
+        Level 1: warning only (REDD is already reducing)
+        Level 2: liquidate + pause
+        Level 3: liquidate + longer pause
         """
         dd = self.drawdown_from_peak
 
         if dd >= DRAWDOWN_LEVEL_3 and self.drawdown_level < 3:
             self.drawdown_level = 3
             self.pause_until = time.time() + DRAWDOWN_PAUSE_HOURS[3] * 3600
-            log.warning(f"DRAWDOWN LEVEL 3: {dd:.2%} — EMERGENCY, pausing {DRAWDOWN_PAUSE_HOURS[3]}h")
+            log.warning(f"DRAWDOWN LEVEL 3: {dd:.2%} — EMERGENCY LIQUIDATION")
             return {"level": 3, "action": "liquidate", "reduce_pct": 1.0}
 
-        elif dd >= DRAWDOWN_LEVEL_2 and self.drawdown_level < 2:
+        if dd >= DRAWDOWN_LEVEL_2 and self.drawdown_level < 2:
             self.drawdown_level = 2
             self.pause_until = time.time() + DRAWDOWN_PAUSE_HOURS[2] * 3600
-            log.warning(f"DRAWDOWN LEVEL 2: {dd:.2%} — LIQUIDATION, pausing {DRAWDOWN_PAUSE_HOURS[2]}h")
+            log.warning(f"DRAWDOWN LEVEL 2: {dd:.2%} — LIQUIDATION + PAUSE")
             return {"level": 2, "action": "liquidate", "reduce_pct": 1.0}
 
-        elif dd >= DRAWDOWN_LEVEL_1 and self.drawdown_level < 1:
+        if dd >= DRAWDOWN_LEVEL_1 and self.drawdown_level < 1:
             self.drawdown_level = 1
-            log.warning(f"DRAWDOWN LEVEL 1: {dd:.2%} — REDD active, new sizing at {self._redd_multiplier():.0%}")
-            # NO forced sell — REDD handles it. Just log the warning.
+            redd = self._redd_multiplier()
+            log.warning(f"DRAWDOWN LEVEL 1: {dd:.2%} — REDD active, sizing at {redd:.0%}")
             return {"level": 1, "action": "none", "reduce_pct": 0.0}
 
         if dd < DRAWDOWN_LEVEL_1 * 0.5:
@@ -118,17 +116,16 @@ class RiskManager:
         current_exposure_usd: float,
         num_current_positions: int,
         signal_strength: float = 1.0,
-        rank_multiplier: float= 1.0
+        rank_multiplier: float = 1.0,
     ) -> float:
-        """Calculate position size with REDD scaling and regime awareness.
+        """Calculate position size.
 
-        Args:
-            pair: trading pair
-            annualized_vol: coin's annualized volatility
-            current_exposure_usd: total USD in crypto positions
-            num_current_positions: number of open positions
-            signal_strength: from signal engine (0-1)
-            deriv_score: from derivatives (-1 to +1), boosts/reduces size
+        Sizing stack (multiplicative):
+        1. Vol-parity base: TARGET_RISK / daily_vol → risk-budgeted sizing
+        2. Cap: MAX_POSITION_PCT, remaining exposure room
+        3. REDD: smooth drawdown scaling
+        4. Signal strength: model confidence
+        5. Rank multiplier: top-ranked positions get more capital
         """
         if self.is_paused:
             return 0.0
@@ -137,16 +134,13 @@ class RiskManager:
 
         portfolio = self.current_value
 
-        # Effective max exposure adjusted by regime
-        effective_exposure = (
-            MAX_TOTAL_EXPOSURE_PCT
-            * self.regime_exposure_mult
-        )
-        remaining_exposure = (effective_exposure * portfolio) - current_exposure_usd
-        if remaining_exposure <= 0:
+        # Effective max exposure = base × regime multiplier
+        effective_exposure = MAX_TOTAL_EXPOSURE_PCT * self.regime_exposure_mult
+        remaining = (effective_exposure * portfolio) - current_exposure_usd
+        if remaining <= 0:
             return 0.0
 
-        # Volatility-parity base sizing
+        # Vol-parity base
         if annualized_vol <= 0:
             annualized_vol = 0.5
         daily_vol = annualized_vol / np.sqrt(365)
@@ -154,29 +148,26 @@ class RiskManager:
             daily_vol = 0.03
 
         size = (TARGET_RISK_PER_TRADE * portfolio) / daily_vol
-
-        # Cap at per-position max
         size = min(size, MAX_POSITION_PCT * portfolio)
+        size = min(size, remaining)
 
-        # Cap at remaining room
-        size = min(size, remaining_exposure)
-
-        # REDD scaling: smoothly reduce as drawdown grows
+        # REDD scaling
         size *= self._redd_multiplier()
 
-        # Signal strength scaling
+        # Signal & rank scaling
         size *= np.clip(signal_strength, 0.2, 1.3)
-
-        # Top Ranked Trade Scaling 
         size *= rank_multiplier
 
         return max(0.0, size)
 
-    # ─── Trailing Stops (Sortino-Optimized) ─────────────────────
+    # ─── Unified Trailing Stops ─────────────────────────────────
 
-    def update_trailing_stop(self, pair: str, current_price: float,
-                            strategy: str = "breakout", entry_price: float = 0,
-                            entry_features: np.ndarray = None):
+    def update_trailing_stop(
+        self,
+        pair: str,
+        current_price: float,
+        entry_price: float = 0,
+    ):
         """Update or create trailing stop for a position."""
         if pair in self.trailing_stops:
             info = self.trailing_stops[pair]
@@ -184,88 +175,72 @@ class RiskManager:
         else:
             self.trailing_stops[pair] = {
                 "high": current_price,
-                "strategy": strategy,
                 "entry_price": entry_price or current_price,
-                "entry_features": entry_features,
                 "entry_time": time.time(),
+                "partial_taken": False,
             }
 
-    def check_trailing_stop(self, pair: str, current_price: float) -> tuple[bool, str, float]:
-        """Check if trailing stop hit.
+    def check_trailing_stop(
+        self, pair: str, current_price: float
+    ) -> tuple[bool, str, float]:
+        """Check if trailing stop is hit.
 
         Returns (should_exit, reason, exit_fraction).
-        exit_fraction: 1.0 = full exit, 0.5 = partial exit (sell half).
 
-        Sortino-optimized:
-        - Tight stops on downside, NO upside cap on breakouts
-        - Breakouts: PARTIAL EXIT at +3% (sell 50%, lock in gains, let rest run)
-          This reduces downside vol in the Sortino denominator while preserving upside.
-        - Mean-reversion: full exit at profit target (quick trades by design)
+        Unified policy (no strategy branching):
+        1. Hard stop: -HARD_STOP_PCT from entry → full exit
+        2. Partial exit: +PARTIAL_EXIT_PCT from entry → sell PARTIAL_EXIT_FRACTION
+        3. Trailing stop: TRAILING_STOP_PCT from high (TRAILING_STOP_WIDE_PCT after partial)
+        4. Time stop: TIME_STOP_HOURS with < TIME_STOP_MIN_GAIN → full exit
         """
         if pair not in self.trailing_stops:
             return False, "", 1.0
 
         info = self.trailing_stops[pair]
         high = info["high"]
-        strategy = info["strategy"]
         entry = info["entry_price"]
         entry_time = info.get("entry_time", time.time())
-        holding_hours = (time.time() - entry_time) / 3600
         partial_taken = info.get("partial_taken", False)
 
         drop_from_high = (high - current_price) / high if high > 0 else 0
-        pnl_from_entry = (current_price - entry) / entry if entry > 0 else 0
+        pnl = (current_price - entry) / entry if entry > 0 else 0
+        holding_hours = (time.time() - entry_time) / 3600
 
-        # ── Mean reversion: tight stops + profit target (full exits) ──
-        if strategy == "mean_rev":
-            # Hard stop first (most important — cap losses)
-            if pnl_from_entry <= -0.03:
-                log.info(f"HARD STOP [mean_rev]: {pair} {pnl_from_entry:.2%} from entry")
-                return True, "hard_stop", 1.0
-            # Trailing only when in profit (don't trail below entry)
-            if drop_from_high >= 0.02 and pnl_from_entry > 0:
-                log.info(f"TRAILING STOP [mean_rev]: {pair} -{drop_from_high:.2%} from high")
-                return True, "trailing_stop", 1.0
-            if pnl_from_entry >= 0.03:
-                log.info(f"PROFIT TARGET [mean_rev]: {pair} +{pnl_from_entry:.2%}")
-                return True, "profit_target", 1.0
-            if holding_hours > 48 and pnl_from_entry < 0.005:
-                log.info(f"TIME STOP [mean_rev]: {pair} held {holding_hours:.0f}h")
-                return True, "time_stop", 1.0
+        # 1. Hard stop (most important — cap losses)
+        if pnl <= -HARD_STOP_PCT:
+            log.info(f"HARD STOP: {pair} {pnl:+.2%} from entry")
+            return True, "hard_stop", 1.0
 
-        # ── Breakout: partial exit at +3%, trailing stop, NO upside cap ──
-        else:
-            # Hard stop near entry
-            if pnl_from_entry <= -0.04:
-                log.info(f"HARD STOP [breakout]: {pair} {pnl_from_entry:.2%} from entry")
-                return True, "hard_stop", 1.0
+        # 2. Partial exit at profit target (Sortino optimization)
+        if pnl >= PARTIAL_EXIT_PCT and not partial_taken:
+            log.info(
+                f"PARTIAL EXIT: {pair} +{pnl:.2%}, "
+                f"selling {PARTIAL_EXIT_FRACTION:.0%}"
+            )
+            info["partial_taken"] = True
+            return True, "partial_exit", PARTIAL_EXIT_FRACTION
 
-            # PARTIAL EXIT: sell 50% at +3% to lock in gains (Sortino optimization)
-            # The locked-in profit reduces variance of outcomes
-            # The remaining 50% rides with no upside cap
-            if pnl_from_entry >= 0.03 and not partial_taken:
-                log.info(f"PARTIAL EXIT [breakout]: {pair} +{pnl_from_entry:.2%}, selling 50%")
-                info["partial_taken"] = True
-                # After partial, widen the trailing stop for the remaining position
-                info["entry_price"] = entry  # keep original entry for PnL tracking
-                return True, "partial_exit", 0.5
+        # 3. Trailing stop
+        trail_pct = TRAILING_STOP_WIDE_PCT if partial_taken else TRAILING_STOP_PCT
+        # Only trail when we're in profit or after partial
+        if (partial_taken or pnl > 0.02) and drop_from_high >= trail_pct:
+            log.info(
+                f"TRAILING STOP: {pair} -{drop_from_high:.2%} from high "
+                f"(threshold: {trail_pct:.1%})"
+            )
+            return True, "trailing_stop", 1.0
 
-            # Trailing stop (only after partial or in profit zone)
-            if partial_taken or pnl_from_entry > 0.02:
-                trail_pct = 0.04 if partial_taken else 0.03  # wider after partial
-                if drop_from_high >= trail_pct:
-                    log.info(f"TRAILING STOP [breakout]: {pair} -{drop_from_high:.2%} from high")
-                    return True, "trailing_stop", 1.0
-
-            # Time stop
-            if holding_hours > 72 and pnl_from_entry < 0.01:
-                log.info(f"TIME STOP [breakout]: {pair} held {holding_hours:.0f}h")
-                return True, "time_stop", 1.0
+        # 4. Time stop
+        if holding_hours > TIME_STOP_HOURS and pnl < TIME_STOP_MIN_GAIN:
+            log.info(
+                f"TIME STOP: {pair} held {holding_hours:.0f}h, "
+                f"PnL={pnl:+.2%} < {TIME_STOP_MIN_GAIN:.0%}"
+            )
+            return True, "time_stop", 1.0
 
         return False, "", 1.0
 
     def clear_trailing_stop(self, pair: str) -> Optional[dict]:
-        """Remove trailing stop, return the stop info (for ML training)."""
         return self.trailing_stops.pop(pair, None)
 
     def get_status(self) -> dict:
@@ -280,6 +255,8 @@ class RiskManager:
                 MAX_TOTAL_EXPOSURE_PCT * self.regime_exposure_mult, 3
             ),
             "is_paused": self.is_paused,
-            "pause_remaining_min": max(0, round((self.pause_until - time.time()) / 60, 1)),
+            "pause_remaining_min": max(
+                0, round((self.pause_until - time.time()) / 60, 1)
+            ),
             "open_stops": len(self.trailing_stops),
         }

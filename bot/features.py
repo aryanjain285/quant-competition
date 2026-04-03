@@ -1,12 +1,23 @@
 """
-Cross-sectional feature engine.
+Cross-sectional feature engine — Finals v6.
 
 ALL LOOKBACKS ARE IN 1-HOUR BARS. One bar = one hour.
 Annualization: sqrt(24 * 365) = sqrt(8760) ≈ 93.6 for hourly data.
+
+Features are designed for cross-sectional ranking via Lasso:
+- Multi-horizon momentum (r_6h, r_24h, r_3d)
+- Trend quality (persistence, choppiness)
+- Risk (realized_vol, downside_vol, jump_proxy)
+- Breakout (breakout_distance, volume_ratio)
+- Mean-reversion (overshoot)
+- Cost (spread_pct)
+
+r_1h is intentionally excluded — at 1-hour resolution it's essentially noise
+and adds no cross-sectional predictive power.
 """
 import numpy as np
 from typing import Optional
-from bot.config import ANNUALIZATION_FACTOR
+from bot.config import ANNUALIZATION_FACTOR, MOMENTUM_LOOKBACKS
 
 
 def _safe_div(a: float, b: float, default: float = 0.0) -> float:
@@ -25,6 +36,7 @@ def zscore_array(arr: np.ndarray) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════
 
 def compute_returns(closes: np.ndarray, lookbacks: dict[str, int]) -> dict[str, float]:
+    """Multi-horizon returns. Each lookback is in 1h bars."""
     result = {}
     for label, lb in lookbacks.items():
         if len(closes) > lb + 1 and closes[-(lb + 1)] > 0:
@@ -35,7 +47,11 @@ def compute_returns(closes: np.ndarray, lookbacks: dict[str, int]) -> dict[str, 
 
 
 def compute_persistence(closes: np.ndarray, lookback: int = 24) -> float:
-    """Fraction of sub-period returns aligned with net direction. 24 bars = 24h."""
+    """Fraction of sub-period returns aligned with net direction. 24 bars = 24h.
+
+    High persistence (> 0.6) → consistent trend, low false signals.
+    Low persistence (< 0.4) → choppy, mean-reverting microstructure.
+    """
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
     if lookback < 2:
@@ -50,7 +66,10 @@ def compute_persistence(closes: np.ndarray, lookback: int = 24) -> float:
 
 
 def compute_choppiness(closes: np.ndarray, lookback: int = 24) -> float:
-    """Path noisiness. 0 = trending, 1 = choppy. 24 bars = 24h."""
+    """Path noisiness. 0 = pure trend, 1 = pure chop. 24 bars = 24h.
+
+    Measures net displacement / total path length.
+    """
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
     if lookback < 2:
@@ -72,7 +91,10 @@ def compute_realized_vol(closes: np.ndarray, lookback: int = 24) -> float:
 
 
 def compute_downside_vol(closes: np.ndarray, lookback: int = 24) -> float:
-    """Annualized downside vol. 24 bars = 24h."""
+    """Annualized downside vol. 24 bars = 24h.
+
+    Only negative returns contribute — directly relevant to Sortino denominator.
+    """
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
     if lookback < 2:
@@ -83,7 +105,10 @@ def compute_downside_vol(closes: np.ndarray, lookback: int = 24) -> float:
 
 
 def compute_jump_proxy(closes: np.ndarray, lookback: int = 24) -> float:
-    """Max |return| / realized vol. Measures tail risk."""
+    """Max |return| / realized vol. Measures tail risk.
+
+    High jump_proxy → fat tails, gap risk. Lasso can learn to penalize this.
+    """
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
     if lookback < 10:
@@ -93,26 +118,27 @@ def compute_jump_proxy(closes: np.ndarray, lookback: int = 24) -> float:
     return float(np.max(np.abs(log_rets)) / vol) if vol > 0 else 0.0
 
 
-def compute_risk_penalty(rv: float, dv: float, jp: float,
-                         a=0.25, b=0.45, c=0.30) -> float:
-    return a * rv + b * dv + c * jp
-
-
-def compute_cost_penalty(spread: float, short_vol: float,
-                         delta=0.60, gamma=0.40) -> float:
-    return delta * spread + gamma * short_vol
-
-
 def compute_breakout_distance(closes: np.ndarray, highs: np.ndarray, lookback: int = 72) -> float:
-    """Distance above prior rolling high. 72 bars = 72h = 3 days."""
+    """Distance above prior rolling high. 72 bars = 72h = 3 days.
+
+    Positive = trading above recent high (breakout).
+    Negative = below recent high (consolidation/decline).
+    """
     if len(closes) < lookback + 1:
         return 0.0
-    prior_high = np.max(highs[-(lookback + 1):-1]) if len(highs) >= lookback + 1 else np.max(closes[-(lookback + 1):-1])
+    if len(highs) >= lookback + 1:
+        prior_high = np.max(highs[-(lookback + 1):-1])
+    else:
+        prior_high = np.max(closes[-(lookback + 1):-1])
     return (closes[-1] - prior_high) / prior_high if prior_high > 0 else 0.0
 
 
 def compute_volume_ratio(volumes: np.ndarray, lookback: int = 72) -> float:
-    """Recent volume (last 3 bars = 3h) vs lookback average. 72 bars = 72h."""
+    """Recent volume (last 3 bars = 3h) vs lookback average. 72 bars = 72h.
+
+    >1.0 = elevated volume (confirms move).
+    Proven in v3 backtest as single biggest signal improvement.
+    """
     if len(volumes) < lookback + 3:
         return 1.0
     recent = np.mean(volumes[-3:])
@@ -125,8 +151,11 @@ def compute_overshoot(closes: np.ndarray, lookback: int = 168) -> float:
 
     horizon = 6 bars (6h on 1h data).
     lookback = 168 bars (7 days) for reference distribution.
+
+    Strongly negative → coin dropped much more than its own recent history.
+    This is the mean-reversion signal — Lasso learns the coefficient.
     """
-    horizon = 6  # 6 hours
+    horizon = 6
     if len(closes) < lookback + horizon:
         lookback = len(closes) - horizon - 1
     if lookback < horizon * 2:
@@ -148,9 +177,26 @@ def compute_overshoot(closes: np.ndarray, lookback: int = 168) -> float:
 
 
 def compute_spread_pct(bid: float, ask: float) -> float:
+    """Bid-ask spread as fraction of mid price. Measures liquidity/cost."""
     if bid <= 0 or ask <= 0:
         return 0.0
     return (ask - bid) / ((bid + ask) / 2)
+
+
+def check_breakdown(closes: np.ndarray, lows: np.ndarray, lookback: int = 72) -> bool:
+    """Check if price has broken below recent low (exit signal).
+
+    Uses lookback/3 (min 6h) as the breakdown window.
+    This is the only hard-coded exit signal — everything else is trailing stops.
+    """
+    if len(closes) < lookback + 1:
+        return False
+    breakdown_lb = max(lookback // 3, 6)
+    if len(lows) >= breakdown_lb + 1:
+        prior_low = np.min(lows[-breakdown_lb - 1:-1])
+    else:
+        prior_low = np.min(closes[-breakdown_lb - 1:-1])
+    return closes[-1] < prior_low and prior_low > 0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -160,18 +206,19 @@ def compute_spread_pct(bid: float, ask: float) -> float:
 def compute_coin_features(
     closes: np.ndarray, highs: np.ndarray, lows: np.ndarray,
     volumes: np.ndarray, bid: float, ask: float,
-    lookbacks: dict[str, int] = None, breakout_lookback: int = 72,
+    breakout_lookback: int = 72,
 ) -> Optional[dict]:
-    """Compute ALL raw features for one coin. All lookbacks in 1h bars."""
-    if lookbacks is None:
-        lookbacks = {"1h": 1, "6h": 6, "24h": 24, "3d": 72}
+    """Compute ALL raw features for one coin. All lookbacks in 1h bars.
 
+    Returns dict with keys matching LASSO_FEATURES in config.py,
+    plus 'price' for reference.
+    """
     if len(closes) < 80:
         return None
     if closes[-1] <= 0:
         return None
 
-    rets = compute_returns(closes, lookbacks)
+    rets = compute_returns(closes, MOMENTUM_LOOKBACKS)
     persist = compute_persistence(closes, 24)
     choppy = compute_choppiness(closes, 24)
     rv = compute_realized_vol(closes, 24)
@@ -182,34 +229,44 @@ def compute_coin_features(
     overshoot = compute_overshoot(closes, 168)
     spread = compute_spread_pct(bid, ask)
 
-    # Short-term vol (last 6h for cost penalty)
-    if len(closes) > 7:
-        lr = np.diff(np.log(closes[-7:]))
-        short_vol = float(np.std(lr)) * ANNUALIZATION_FACTOR if len(lr) > 0 else 0
-    else:
-        short_vol = 0
-
     return {
         **rets,
-        "persistence": persist, "choppiness": choppy,
-        "realized_vol": rv, "downside_vol": dv, "jump_proxy": jump,
-        "breakout_distance": bo_dist, "volume_ratio": vol_ratio,
-        "overshoot": overshoot, "spread_pct": spread, "short_vol": short_vol,
+        "persistence": persist,
+        "choppiness": choppy,
+        "realized_vol": rv,
+        "downside_vol": dv,
+        "jump_proxy": jump,
+        "breakout_distance": bo_dist,
+        "volume_ratio": vol_ratio,
+        "overshoot": overshoot,
+        "spread_pct": spread,
         "price": closes[-1],
     }
 
 
 # ═══════════════════════════════════════════════════════════════
-# CROSS-SECTIONAL Z-SCORING + SUBMODELS + MARKET FEATURES
+# CROSS-SECTIONAL Z-SCORING
 # ═══════════════════════════════════════════════════════════════
 
-def zscore_universe(all_features: dict[str, dict], feature_keys: list[str] = None) -> dict[str, dict]:
+def zscore_universe(
+    all_features: dict[str, dict],
+    feature_keys: list[str] = None,
+) -> dict[str, dict]:
+    """Z-score features cross-sectionally across all coins.
+
+    Each feature is standardized to mean=0, std=1 across the universe.
+    This makes Lasso coefficients comparable and prevents high-magnitude
+    features from dominating.
+    """
     if not all_features:
         return {}
     pairs = list(all_features.keys())
     if feature_keys is None:
         first = next(iter(all_features.values()))
-        feature_keys = [k for k, v in first.items() if isinstance(v, (int, float)) and k != "price"]
+        feature_keys = [
+            k for k, v in first.items()
+            if isinstance(v, (int, float)) and k != "price"
+        ]
 
     zscored = {p: {} for p in pairs}
     for key in feature_keys:
@@ -217,31 +274,10 @@ def zscore_universe(all_features: dict[str, dict], feature_keys: list[str] = Non
         z = zscore_array(vals)
         for i, p in enumerate(pairs):
             zscored[p][key] = float(z[i])
+
+    # Pass through non-numeric / excluded fields
     for p in pairs:
         for k, v in all_features[p].items():
             if k not in feature_keys:
                 zscored[p][k] = v
     return zscored
-
-
-def compute_submodel_scores(zf: dict) -> dict:
-    zf["risk_penalty"] = round(compute_risk_penalty(
-        zf.get("realized_vol", 0), zf.get("downside_vol", 0), zf.get("jump_proxy", 0)), 4)
-    zf["cost_penalty"] = round(compute_cost_penalty(
-        zf.get("spread_pct", 0), zf.get("short_vol", 0)), 4)
-    return zf
-
-
-def compute_market_features(all_raw: dict[str, dict]) -> dict:
-    if not all_raw:
-        return {"breadth": 0.5, "trend_strength": 0.0, "mkt_downside_vol": 0.0, "cost_stress": 0.0}
-    pairs = list(all_raw.keys())
-    r24h = [all_raw[p].get("r_24h", 0) for p in pairs]
-    dvs = [all_raw[p].get("downside_vol", 0) for p in pairs]
-    spreads = [all_raw[p].get("spread_pct", 0) for p in pairs]
-    return {
-        "breadth": round(sum(1 for r in r24h if r > 0) / len(pairs), 4),
-        "trend_strength": round(float(np.median(r24h)), 6),
-        "mkt_downside_vol": round(float(np.median(dvs)), 4),
-        "cost_stress": round(float(np.median(spreads)), 6),
-    }
