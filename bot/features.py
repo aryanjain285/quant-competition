@@ -1,23 +1,20 @@
 """
-Cross-sectional feature engine — Finals v6.
+Cross-sectional feature engine — Finals v7.
 
 ALL LOOKBACKS ARE IN 1-HOUR BARS. One bar = one hour.
 Annualization: sqrt(24 * 365) = sqrt(8760) ≈ 93.6 for hourly data.
 
-Features are designed for cross-sectional ranking via Lasso:
-- Multi-horizon momentum (r_6h, r_24h, r_3d)
-- Trend quality (persistence, choppiness)
-- Risk (realized_vol, downside_vol, jump_proxy)
-- Breakout (breakout_distance, volume_ratio)
-- Mean-reversion (overshoot)
-- Cost (spread_pct)
-
-r_1h is intentionally excluded — at 1-hour resolution it's essentially noise
-and adds no cross-sectional predictive power.
+v7 additions:
+- compute_momentum_score(): weighted composite for ranking
+- check_entry_gate(): simple binary conditions for entry filtering
+- check_breakdown(): technical breakdown exit signal (moved from signals.py)
 """
 import numpy as np
 from typing import Optional
-from bot.config import ANNUALIZATION_FACTOR, MOMENTUM_LOOKBACKS
+from bot.config import (
+    ANNUALIZATION_FACTOR, MOMENTUM_LOOKBACKS, SCORE_WEIGHTS,
+    GATE_MIN_R24H, GATE_MIN_VOLUME_RATIO,
+)
 
 
 def _safe_div(a: float, b: float, default: float = 0.0) -> float:
@@ -47,11 +44,7 @@ def compute_returns(closes: np.ndarray, lookbacks: dict[str, int]) -> dict[str, 
 
 
 def compute_persistence(closes: np.ndarray, lookback: int = 24) -> float:
-    """Fraction of sub-period returns aligned with net direction. 24 bars = 24h.
-
-    High persistence (> 0.6) → consistent trend, low false signals.
-    Low persistence (< 0.4) → choppy, mean-reverting microstructure.
-    """
+    """Fraction of sub-period returns aligned with net direction. 24 bars = 24h."""
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
     if lookback < 2:
@@ -66,10 +59,7 @@ def compute_persistence(closes: np.ndarray, lookback: int = 24) -> float:
 
 
 def compute_choppiness(closes: np.ndarray, lookback: int = 24) -> float:
-    """Path noisiness. 0 = pure trend, 1 = pure chop. 24 bars = 24h.
-
-    Measures net displacement / total path length.
-    """
+    """Path noisiness. 0 = pure trend, 1 = pure chop. 24 bars = 24h."""
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
     if lookback < 2:
@@ -81,7 +71,7 @@ def compute_choppiness(closes: np.ndarray, lookback: int = 24) -> float:
 
 
 def compute_realized_vol(closes: np.ndarray, lookback: int = 24) -> float:
-    """Annualized realized vol. 24 bars = 24h. Annualize with sqrt(8760)."""
+    """Annualized realized vol. 24 bars = 24h."""
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
     if lookback < 2:
@@ -91,10 +81,7 @@ def compute_realized_vol(closes: np.ndarray, lookback: int = 24) -> float:
 
 
 def compute_downside_vol(closes: np.ndarray, lookback: int = 24) -> float:
-    """Annualized downside vol. 24 bars = 24h.
-
-    Only negative returns contribute — directly relevant to Sortino denominator.
-    """
+    """Annualized downside vol. Sortino-relevant risk measure."""
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
     if lookback < 2:
@@ -105,10 +92,7 @@ def compute_downside_vol(closes: np.ndarray, lookback: int = 24) -> float:
 
 
 def compute_jump_proxy(closes: np.ndarray, lookback: int = 24) -> float:
-    """Max |return| / realized vol. Measures tail risk.
-
-    High jump_proxy → fat tails, gap risk. Lasso can learn to penalize this.
-    """
+    """Max |return| / realized vol. Tail risk measure."""
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
     if lookback < 10:
@@ -119,11 +103,7 @@ def compute_jump_proxy(closes: np.ndarray, lookback: int = 24) -> float:
 
 
 def compute_breakout_distance(closes: np.ndarray, highs: np.ndarray, lookback: int = 72) -> float:
-    """Distance above prior rolling high. 72 bars = 72h = 3 days.
-
-    Positive = trading above recent high (breakout).
-    Negative = below recent high (consolidation/decline).
-    """
+    """Distance above prior rolling high. 72 bars = 72h = 3 days."""
     if len(closes) < lookback + 1:
         return 0.0
     if len(highs) >= lookback + 1:
@@ -134,11 +114,7 @@ def compute_breakout_distance(closes: np.ndarray, highs: np.ndarray, lookback: i
 
 
 def compute_volume_ratio(volumes: np.ndarray, lookback: int = 72) -> float:
-    """Recent volume (last 3 bars = 3h) vs lookback average. 72 bars = 72h.
-
-    >1.0 = elevated volume (confirms move).
-    Proven in v3 backtest as single biggest signal improvement.
-    """
+    """Recent volume (last 3h) vs lookback average. Volume confirmation."""
     if len(volumes) < lookback + 3:
         return 1.0
     recent = np.mean(volumes[-3:])
@@ -147,14 +123,7 @@ def compute_volume_ratio(volumes: np.ndarray, lookback: int = 72) -> float:
 
 
 def compute_overshoot(closes: np.ndarray, lookback: int = 168) -> float:
-    """Z-score of 6h return vs distribution of 6h returns over lookback.
-
-    horizon = 6 bars (6h on 1h data).
-    lookback = 168 bars (7 days) for reference distribution.
-
-    Strongly negative → coin dropped much more than its own recent history.
-    This is the mean-reversion signal — Lasso learns the coefficient.
-    """
+    """Z-score of 6h return vs distribution of 6h returns over lookback."""
     horizon = 6
     if len(closes) < lookback + horizon:
         lookback = len(closes) - horizon - 1
@@ -177,18 +146,14 @@ def compute_overshoot(closes: np.ndarray, lookback: int = 168) -> float:
 
 
 def compute_spread_pct(bid: float, ask: float) -> float:
-    """Bid-ask spread as fraction of mid price. Measures liquidity/cost."""
+    """Bid-ask spread as fraction of mid price."""
     if bid <= 0 or ask <= 0:
         return 0.0
     return (ask - bid) / ((bid + ask) / 2)
 
 
 def check_breakdown(closes: np.ndarray, lows: np.ndarray, lookback: int = 72) -> bool:
-    """Check if price has broken below recent low (exit signal).
-
-    Uses lookback/3 (min 6h) as the breakdown window.
-    This is the only hard-coded exit signal — everything else is trailing stops.
-    """
+    """Check if price has broken below recent low (exit signal)."""
     if len(closes) < lookback + 1:
         return False
     breakdown_lb = max(lookback // 3, 6)
@@ -208,38 +173,25 @@ def compute_coin_features(
     volumes: np.ndarray, bid: float, ask: float,
     breakout_lookback: int = 72,
 ) -> Optional[dict]:
-    """Compute ALL raw features for one coin. All lookbacks in 1h bars.
-
-    Returns dict with keys matching LASSO_FEATURES in config.py,
-    plus 'price' for reference.
-    """
+    """Compute ALL raw features for one coin."""
     if len(closes) < 80:
         return None
     if closes[-1] <= 0:
         return None
 
     rets = compute_returns(closes, MOMENTUM_LOOKBACKS)
-    persist = compute_persistence(closes, 24)
-    choppy = compute_choppiness(closes, 24)
-    rv = compute_realized_vol(closes, 24)
-    dv = compute_downside_vol(closes, 24)
-    jump = compute_jump_proxy(closes, 24)
-    bo_dist = compute_breakout_distance(closes, highs, breakout_lookback)
-    vol_ratio = compute_volume_ratio(volumes, breakout_lookback)
-    overshoot = compute_overshoot(closes, 168)
-    spread = compute_spread_pct(bid, ask)
 
     return {
         **rets,
-        "persistence": persist,
-        "choppiness": choppy,
-        "realized_vol": rv,
-        "downside_vol": dv,
-        "jump_proxy": jump,
-        "breakout_distance": bo_dist,
-        "volume_ratio": vol_ratio,
-        "overshoot": overshoot,
-        "spread_pct": spread,
+        "persistence": compute_persistence(closes, 24),
+        "choppiness": compute_choppiness(closes, 24),
+        "realized_vol": compute_realized_vol(closes, 24),
+        "downside_vol": compute_downside_vol(closes, 24),
+        "jump_proxy": compute_jump_proxy(closes, 24),
+        "breakout_distance": compute_breakout_distance(closes, highs, breakout_lookback),
+        "volume_ratio": compute_volume_ratio(volumes, breakout_lookback),
+        "overshoot": compute_overshoot(closes, 168),
+        "spread_pct": compute_spread_pct(bid, ask),
         "price": closes[-1],
     }
 
@@ -252,12 +204,7 @@ def zscore_universe(
     all_features: dict[str, dict],
     feature_keys: list[str] = None,
 ) -> dict[str, dict]:
-    """Z-score features cross-sectionally across all coins.
-
-    Each feature is standardized to mean=0, std=1 across the universe.
-    This makes Lasso coefficients comparable and prevents high-magnitude
-    features from dominating.
-    """
+    """Z-score features cross-sectionally across all coins."""
     if not all_features:
         return {}
     pairs = list(all_features.keys())
@@ -281,3 +228,45 @@ def zscore_universe(
             if k not in feature_keys:
                 zscored[p][k] = v
     return zscored
+
+
+# ═══════════════════════════════════════════════════════════════
+# MOMENTUM COMPOSITE SCORE & ENTRY GATE
+# ═══════════════════════════════════════════════════════════════
+
+def compute_momentum_score(zscored_features: dict) -> float:
+    """Compute weighted momentum composite from z-scored features.
+
+    Uses z-scored values so all features are on the same scale.
+    The score is unit-free — it's a weighted sum of z-scores.
+    Higher = better candidate for buying.
+
+    Weights from SCORE_WEIGHTS in config.py:
+        r_6h:  0.15  (short-term shift)
+        r_24h: 0.50  (core momentum signal)
+        r_3d:  0.35  (medium-term trend)
+        persistence: +0.10  (trend quality bonus)
+        choppiness:  -0.10  (noise penalty)
+        volume_ratio: +0.05  (volume confirmation)
+    """
+    score = 0.0
+    for feature, weight in SCORE_WEIGHTS.items():
+        score += weight * zscored_features.get(feature, 0.0)
+    return score
+
+
+def check_entry_gate(raw_features: dict) -> bool:
+    """Simple binary gate on RAW (not z-scored) features.
+
+    Conditions:
+    1. r_24h > 0: positive 24h momentum (don't buy declining coins)
+    2. volume_ratio > 0.8: minimum volume activity
+
+    These are deliberately loose. The ranking score handles quality;
+    the gate just eliminates the obviously wrong entries.
+    """
+    if raw_features.get("r_24h", 0) <= GATE_MIN_R24H:
+        return False
+    if raw_features.get("volume_ratio", 0) < GATE_MIN_VOLUME_RATIO:
+        return False
+    return True

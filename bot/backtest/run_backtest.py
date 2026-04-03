@@ -116,7 +116,7 @@ def main():
     parser.add_argument("--months", type=int, default=4, help="Months of data to download")
     parser.add_argument("--window", type=int, default=240, help="Rolling window size (bars)")
     parser.add_argument("--step", type=int, default=72, help="Rolling window step (bars)")
-    parser.add_argument("--warmup", type=int, default=200, help="Warmup bars before first window")
+    parser.add_argument("--warmup", type=int, default=600, help="Warmup bars (must be > ML_LOOKBACK + ML_FORWARD + 100 = 524)")
     args = parser.parse_args()
 
     print("=" * 70)

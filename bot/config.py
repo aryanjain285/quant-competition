@@ -1,16 +1,22 @@
 """
-Configuration for the trading bot — Finals v6.
+Configuration for the trading bot — Finals v7.
 All tunable parameters in one place. Override via environment variables.
 
 ALL LOOKBACKS AND WINDOWS ARE IN 1-HOUR BARS.
-The bot fetches 1h candles from Binance. Every bar = 1 hour.
 
-PARAMETER JUSTIFICATION:
-- Commission: 0.05% maker, 0.1% taker → round trip = 0.10-0.20%
-- ENTRY_THRESHOLD: 0.003 (30 bps) > round-trip cost → only trade when expected profit covers costs
-- TARGET_RISK_PER_TRADE: 0.005 → at BTC vol=0.4, this gives ~$238K sizing on $1M portfolio
-- Trailing stops: unified at 3.5% → calibrated to 1h bar noise (hourly vol ~2% annualized → 3.5% ≈ 1.7σ daily)
-- HMM_N_COMPONENTS: 3 PCs fixed → 24 HMM params, stable with 1000 observations
+v7 DESIGN PHILOSOPHY:
+- HMM discovers latent states; we analyze them AFTER fitting to derive exposure
+- No ML prediction gate (Lasso R²≈0.000 on cross-sectional crypto features)
+- Momentum composite with domain-knowledge weights (crypto momentum literature)
+- Active trading to satisfy 8 active trading days rule
+- Every parameter justified by cost, stats, or literature
+
+PARAMETER SOURCES:
+- Momentum weights: Liu, Tsyvinski & Wu (2019) "Risks and Returns of Cryptocurrency"
+  → 1-week (24h-168h) momentum is the strongest cross-sectional predictor in crypto
+- Commission: 0.05% maker, 0.10% taker → 10-20 bps round trip
+- Vol-parity: standard risk budgeting (Roncalli 2013)
+- Trailing stops: calibrated to hourly crypto vol (~2% daily → 3.5% ≈ 1.7σ)
 """
 import os
 
@@ -33,71 +39,108 @@ BASE_URL = os.getenv("ROOSTOO_BASE_URL", "https://mock-api.roostoo.com")
 BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
 BINANCE_FUTURES_URL = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com")
 
-# --- Timing (1h bars → 1h cycle) ---
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL", "3600"))  # 1 hour
+# --- Timing ---
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL", "3600"))
 LIMIT_ORDER_TIMEOUT_SECONDS = 90
 
-# --- Signal Parameters (ALL IN 1-HOUR BARS) ---
+# --- Momentum Lookbacks (1h bars) ---
+# r_1h intentionally excluded: noise at 1-bar resolution
 MOMENTUM_LOOKBACKS = {
-    "6h": 6,      # 6 bars = 6 hours
-    "24h": 24,    # 24 bars = 24 hours (1 day)
-    "3d": 72,     # 72 bars = 72 hours (3 days)
+    "6h": 6,
+    "24h": 24,
+    "3d": 72,
 }
-# Note: r_1h dropped — too noisy for cross-sectional prediction (< 1 bar of signal)
 
-BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "72"))  # 72 bars = 72h = 3 days
+BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "72"))
 
-# --- Volatility (1h bars) ---
-VOL_LOOKBACK = 24              # 24 bars = 24 hours for realized vol
-VOL_LONG_LOOKBACK = 168        # 168 bars = 7 days for regime baseline
-ANNUALIZATION_FACTOR = 93.6    # sqrt(24 * 365) = sqrt(8760) for 1h bars
+# --- Volatility ---
+VOL_LOOKBACK = 24
+VOL_LONG_LOOKBACK = 168
+ANNUALIZATION_FACTOR = 93.6  # sqrt(8760) for 1h bars
 
-# --- Regime Detection ---
-# Fixed K=3 PCs for HMM observation vector.
-# Rationale: 3 PCs typically capture 70-85% of variance in a 43-coin crypto universe.
-# 3-state HMM with 3D observations: ~24 covariance params. Stable with 1000+ bars.
-# Increasing K beyond 3 risks overfitting the HMM (params scale as K²).
-HMM_N_PCS = 3
+# --- Regime Detection (HMM on PCs) ---
+# 4 PCs: typically 80-90% of variance in 43-coin crypto universe.
+# 3-state HMM with 4D obs: ~50 params. Stable with 800+ observations.
+# States are NOT pre-labeled. They are analyzed post-fit to derive exposure.
+HMM_N_PCS = 4
 HMM_N_STATES = 3
-HMM_REFIT_INTERVAL_HOURS = 12  # refit HMM every 12 cycles
-PCA_REFIT_INTERVAL_HOURS = 6   # refit PCA loadings every 6 hours
+HMM_REFIT_INTERVAL_HOURS = 12
+PCA_REFIT_INTERVAL_HOURS = 6
 
-# Regime exposure multipliers:
-# LOW_VOL = 1.0: calm markets → clean trends → full sizing (vol-parity already scales per-coin)
-# MID_VOL = 0.7: normal conditions → moderate sizing
-# HI_VOL  = 0.0: crisis → sit out entirely
-# Rationale: vol-parity handles coin-level vol. Regime multiplier handles systemic risk.
-# Halving in LOW_VOL (old design) was double-penalizing low vol. Flipped for Sortino optimization.
-REGIME_EXPOSURE = {
-    "LOW_VOL": 1.0,
-    "MID_VOL": 0.7,
-    "HI_VOL": 0.0,
+# Forward return horizon for state analysis (how far ahead to look when
+# characterizing each state's profitability).
+STATE_ANALYSIS_FORWARD_HOURS = 24
+
+# --- Momentum Composite Score ---
+# Weights for the cross-sectional ranking score.
+# Applied to Z-SCORED features so all are on the same scale.
+#
+# Weight justification:
+#   r_24h (0.50): strongest single cross-sectional predictor in crypto
+#   r_3d  (0.35): captures medium-term trend, overlaps with 1-week momentum
+#   r_6h  (0.15): short-term momentum shift, noisier but captures recent moves
+#   persistence (+0.10): higher = more internally consistent trend
+#   choppiness (-0.10): lower = cleaner path (less noise)
+#   volume_ratio (+0.05): volume confirmation of move (proven in v3 backtest)
+SCORE_WEIGHTS = {
+    "r_6h": 0.15,
+    "r_24h": 0.50,
+    "r_3d": 0.35,
+    "persistence": 0.10,
+    "choppiness": -0.10,
+    "volume_ratio": 0.05,
 }
 
-# --- ML Model ---
-# Entry gate: predicted 24h return must exceed this to open a position.
-# 30 bps > round-trip commission (10-20 bps) + slippage buffer.
-# This replaces the old 7-condition conjunction filter with a single model-derived gate.
-ENTRY_THRESHOLD = 0.003
+# Entry gate (simple binary conditions on RAW features, not z-scored):
+#   r_24h > 0: only buy coins with positive 24h momentum
+#   volume_ratio > 0.8: minimum volume confirmation
+# These are deliberately loose — we want active trading.
+# The ranking score handles quality; the gate just eliminates obvious bad entries.
+GATE_MIN_R24H = 0.0
+GATE_MIN_VOLUME_RATIO = 0.8
 
-# Lasso training parameters
-ML_LOOKBACK_HOURS = 400        # training window
-ML_FORWARD_HORIZON = 24        # predict 24h forward returns
-ML_SAMPLE_INTERVAL = 24        # sample every 24h → non-overlapping targets
-ML_RETRAIN_INTERVAL = 6        # retrain every 6 cycles (hours)
+# Max new entries per cycle — prevents overtrading in a single hour
+MAX_NEW_ENTRIES_PER_CYCLE = 3
 
-# Feature columns for Lasso — explicit and fixed.
-# Rationale for each:
-#   r_6h, r_24h, r_3d: multi-horizon momentum (Jegadeesh & Titman cross-sectional momentum)
-#   persistence: trend quality — higher = more aligned sub-returns
-#   choppiness: path noise — lower = cleaner trend
-#   realized_vol: vol predicts vol, vol predicts cross-sectional returns
-#   downside_vol: Sortino-relevant risk measure
-#   jump_proxy: tail risk — max|return|/vol
-#   breakout_distance: distance above prior high (trend strength)
-#   volume_ratio: volume confirmation (proven in v3 backtest)
-#   overshoot: mean-reversion signal (z-scored drop magnitude)
-#   spread_pct: liquidity/cost proxy
+# --- Risk Management ---
+MAX_POSITION_PCT = 0.15
+MAX_TOTAL_EXPOSURE_PCT = 0.80
+TARGET_RISK_PER_TRADE = 0.005
+MAX_POSITIONS = 12
+
+# Unified trailing stops (no strategy branching)
+HARD_STOP_PCT = 0.035
+PARTIAL_EXIT_PCT = 0.03
+PARTIAL_EXIT_FRACTION = 0.5
+TRAILING_STOP_PCT = 0.035
+TRAILING_STOP_WIDE_PCT = 0.045
+TIME_STOP_HOURS = 60
+TIME_STOP_MIN_GAIN = 0.01
+
+# Drawdown circuit breakers
+DRAWDOWN_LEVEL_1 = 0.035
+DRAWDOWN_LEVEL_2 = 0.06
+DRAWDOWN_LEVEL_3 = 0.10
+DRAWDOWN_PAUSE_HOURS = {1: 0, 2: 4, 3: 12}
+REDD_MAX_DD = 0.10
+
+# --- Execution ---
+USE_LIMIT_ORDERS = True
+LIMIT_ORDER_OFFSET_BPS = 1
+
+# --- Optional ML (Lasso runs in background, boosts score when it finds signal) ---
+ML_ENABLED = True
+ML_LOOKBACK_HOURS = 400
+ML_FORWARD_HORIZON = 24
+ML_SAMPLE_INTERVAL = 24
+ML_RETRAIN_INTERVAL = 6
+# When Lasso has signal, blend its prediction into the score.
+# blend_score = (1 - ML_BLEND_WEIGHT) * momentum_score + ML_BLEND_WEIGHT * lasso_pred
+# Only active when Lasso R² > ML_MIN_R2 (i.e., model actually found something).
+ML_BLEND_WEIGHT = 0.3
+ML_MIN_R2 = 0.005
+
+# Feature columns for Lasso (when enabled)
 LASSO_FEATURES = [
     "r_6h", "r_24h", "r_3d",
     "persistence", "choppiness",
@@ -106,45 +149,6 @@ LASSO_FEATURES = [
     "overshoot",
     "spread_pct",
 ]
-
-# --- Risk Management ---
-MAX_POSITION_PCT = 0.15
-MAX_TOTAL_EXPOSURE_PCT = 0.80
-TARGET_RISK_PER_TRADE = 0.005
-MAX_POSITIONS = 12
-
-# Unified trailing stop parameters (no strategy branching):
-# Hard stop: -3.5% from entry
-#   Rationale: BTC hourly vol ≈ 0.4 ann → daily vol ≈ 2.1% → 3.5% ≈ 1.7σ daily move.
-#   Gives room for normal noise but caps losses before they compound.
-HARD_STOP_PCT = 0.035
-
-# Partial exit: sell 50% at +3% from entry
-#   Rationale: locks in profit, reduces Sortino denominator (less variance in outcomes).
-#   Remaining 50% rides with wider trailing stop.
-PARTIAL_EXIT_PCT = 0.03
-PARTIAL_EXIT_FRACTION = 0.5
-
-# Trailing stop: 3.5% from high (4.5% after partial exit)
-#   Rationale: after partial, remaining position has "house money" character → wider trail.
-TRAILING_STOP_PCT = 0.035
-TRAILING_STOP_WIDE_PCT = 0.045  # after partial exit
-
-# Time stop: 60h with < 1% gain
-#   Rationale: opportunity cost. If position hasn't moved in 2.5 days, capital is better elsewhere.
-TIME_STOP_HOURS = 60
-TIME_STOP_MIN_GAIN = 0.01
-
-# Drawdown circuit breakers (REDD handles smooth scaling; these are emergency)
-DRAWDOWN_LEVEL_1 = 0.035
-DRAWDOWN_LEVEL_2 = 0.06
-DRAWDOWN_LEVEL_3 = 0.10
-DRAWDOWN_PAUSE_HOURS = {1: 0, 2: 4, 3: 12}
-REDD_MAX_DD = 0.10  # REDD goes to 0 at this drawdown level
-
-# --- Execution ---
-USE_LIMIT_ORDERS = True
-LIMIT_ORDER_OFFSET_BPS = 1
 
 # --- Coin Filtering ---
 TRADEABLE_COINS = [
