@@ -134,9 +134,12 @@ class RegimeDetector:
         else:
             std = self._pca_std.copy()
             std[std == 0] = 1.0
-            returns_z = (returns - self._pca_mean) / std
-            returns_z = np.nan_to_num(returns_z, nan=0.0, posinf=0.0, neginf=0.0)
-            pc_scores = returns_z @ self._pca_model.components_.T
+            with np.errstate(all='ignore'):
+                returns_z = (returns - self._pca_mean) / std
+                returns_z = np.nan_to_num(returns_z, nan=0.0, posinf=0.0, neginf=0.0)
+                # Clip extreme z-scores to prevent overflow in matmul
+                returns_z = np.clip(returns_z, -10, 10)
+                pc_scores = returns_z @ self._pca_model.components_.T
 
         pc_scores = np.nan_to_num(pc_scores, nan=0.0, posinf=0.0, neginf=0.0)
         self._latest_pc_scores = pc_scores
@@ -306,16 +309,22 @@ class RegimeDetector:
         worst_sharpe = sharpes[sorted_states[-1]]
         spread = best_sharpe - worst_sharpe
 
+        # Competition constraint: minimum 0.15 exposure in ALL states.
+        # Rationale: competition requires 8 active trading days out of 10.
+        # At 0% exposure the bot sits in cash and fails the activity rule.
+        # 0.15 = small enough to limit bear-state losses (~0.4%/day worst case)
+        #         large enough to generate trades for compliance.
+        # This is a CONSTRAINT OVERRIDE, not a model improvement.
+        COMPETITION_MIN_EXPOSURE = 0.15
+
         for s in range(self.n_states):
             if spread < 0.01:
-                # All states look the same → default moderate exposure
                 self._state_exposure[s] = 0.5
             else:
-                # Linear interpolation: best→1.0, worst→floor
-                rank_frac = (sharpes[s] - worst_sharpe) / spread  # 0 to 1
-                floor = 0.0 if worst_sharpe < -0.05 else 0.2
+                rank_frac = (sharpes[s] - worst_sharpe) / spread
+                raw_exposure = rank_frac  # 0 to 1 linear
                 self._state_exposure[s] = round(
-                    floor + rank_frac * (1.0 - floor), 3
+                    max(COMPETITION_MIN_EXPOSURE, raw_exposure), 3
                 )
 
     def _name_states(self, analysis: dict):
@@ -377,8 +386,10 @@ class RegimeDetector:
         return self._state_exposure.get(self.current_state, 0.5)
 
     def should_trade(self) -> bool:
-        """Whether current state allows new entries."""
-        return self.get_exposure_multiplier() > 0.05
+        """Whether current state allows new entries.
+        Always True now — competition requires 8 active trading days.
+        Exposure multiplier controls sizing, not whether to trade."""
+        return True
 
     def get_status(self) -> dict:
         state_name = self._state_names.get(self.current_state, "UNKNOWN")

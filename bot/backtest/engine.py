@@ -8,7 +8,7 @@ Design: import and call the SAME modules as live trading:
   - ranking.Ranker with Lasso (same ranking + gate)
   - regime_detector.RegimeDetector (same PCA-HMM regime)
   - risk_manager.RiskManager (same unified stops, REDD, sizing)
-  - ml.LassoTrainer (same training pipeline)
+  - ml.RidgeTrainer (same training pipeline)
 
 The ONLY difference is SimExchange instead of RoostooClient.
 
@@ -37,7 +37,7 @@ from bot.ranking import Ranker
 from bot.regime_detector import RegimeDetector
 from bot.risk_manager import RiskManager
 from bot.metrics import PerformanceTracker
-from bot.ml import LassoTrainer
+from bot.ml import RidgeTrainer
 from bot.logger import get_logger
 
 log = get_logger("bt_engine")
@@ -85,7 +85,7 @@ class BacktestEngine:
         return np.column_stack([s[-min_len:] for s in series])
 
     def _build_historical_data(self, t: int) -> dict[str, list[dict]]:
-        """Build dict-of-bars for LassoTrainer up to bar t."""
+        """Build dict-of-bars for RidgeTrainer up to bar t."""
         data = {}
         for pair in self.active_pairs:
             candles = self.all_candles[pair][:t + 1]
@@ -113,7 +113,7 @@ class BacktestEngine:
             ranker = Ranker()
             risk_mgr = RiskManager(initial_cash)
             perf = PerformanceTracker(initial_cash)
-            lasso_trainer = LassoTrainer(self.active_pairs)
+            ridge_trainer = RidgeTrainer(self.active_pairs)
 
             from bot.executor import Executor
             executor = Executor(exchange, self.exchange_info)
@@ -133,9 +133,9 @@ class BacktestEngine:
             if ML_ENABLED:
                 try:
                     hist = self._build_historical_data(start)
-                    model, r2 = lasso_trainer.train(hist)
+                    model, r2 = ridge_trainer.train(hist)
                     if model is not None:
-                        ranker.set_lasso(model, r2)
+                        ranker.set_model(model, r2)
                 except Exception:
                     pass
 
@@ -161,9 +161,9 @@ class BacktestEngine:
                 if ML_ENABLED and cycle_count % ML_RETRAIN_INTERVAL == 1:
                     try:
                         hist = self._build_historical_data(t)
-                        model, r2 = lasso_trainer.train(hist)
+                        model, r2 = ridge_trainer.train(hist)
                         if model is not None:
-                            ranker.set_lasso(model, r2)
+                            ranker.set_model(model, r2)
                     except Exception:
                         pass
 

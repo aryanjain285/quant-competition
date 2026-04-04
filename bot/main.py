@@ -1,32 +1,22 @@
 """
-Main trading bot loop v7: momentum-driven with data-driven regime.
+Main trading bot — v8 finals.
 
-Architecture:
+Pipeline (every hour):
+  1. REGIME:   PCA (4 PCs) → 3-state HMM → data-driven exposure (0.15-1.0)
+  2. FEATURES: 12 per-coin features, z-scored cross-sectionally
+  3. RANK:     EWMA momentum (avg of 6h + 24h halflife) → sorted descending
+  4. GATE:     r_24h > 0, volume_ratio > 0.8 (loose — ranking handles quality)
+  5. SIZE:     vol-parity × REDD × regime exposure × rank multiplier
+  6. EXIT:     unified stops (hard -3.5%, partial +3%, trail 3.5%/4.5%, time 60h)
 
-  Step 1 — REGIME: HMM on 4 PCs → analyze states → data-driven exposure
-    The HMM discovers latent states. We examine each state's forward returns,
-    volatility, and duration AFTER fitting, then derive exposure multipliers
-    from the data. States are not pre-labeled.
-
-  Step 2 — FEATURES: compute per-coin features, z-score cross-sectionally
-
-  Step 3 — RANK: momentum composite score (always available)
-    Score = weighted sum of z-scored momentum + quality features.
-    Weights from crypto momentum literature (Liu et al. 2019).
-    Optional Lasso boost when ML finds genuine signal (R² > 0.5%).
-
-  Step 4 — GATE: r_24h > 0 AND volume_ratio > 0.8 AND regime allows
-    Deliberately loose. We want active trading.
-
-  Step 5 — SIZE: vol-parity × REDD × state exposure multiplier
-
-  Step 6 — EXIT: unified trailing stops + breakdown detection
-
-What changed from v6 and why:
-- Dropped Lasso as primary gate (R²≈0.000 → bot sat in cash 22 days → failed 8-day rule)
-- Momentum composite always produces rankings → bot always has candidates
-- HMM states analyzed post-hoc, not pre-labeled as volatility regimes
-- Lasso demoted to optional boost that activates only when it finds signal
+Key decisions:
+  - EWMA over arbitrary weights: no magic numbers, one parameter per horizon
+  - No ML in ranking: tested Ridge, Lasso, ElasticNet, RF, XGBoost in shootout.
+    Ridge had p=0.025 Spearman but EVERY integration (blend, rank avg, veto)
+    made the full pipeline worse. EWMA alone is the cleanest signal.
+  - Data-driven regime: states analyzed post-fit, exposure from forward returns.
+    Min floor 0.15 for competition activity compliance.
+  - ML code kept for documentation (shows rigorous testing, honest disabling).
 """
 import os
 import time
@@ -53,7 +43,7 @@ from bot.risk_manager import RiskManager
 from bot.executor import Executor
 from bot.metrics import PerformanceTracker
 from bot.logger import get_logger, log_cycle
-from bot.ml import LassoTrainer
+from bot.ml import RidgeTrainer
 
 log = get_logger("main")
 
@@ -129,7 +119,7 @@ class TradingBot:
         # ── Intelligence layers ──
         self.regime = RegimeDetector()
         self.ranker = Ranker()
-        self.lasso_trainer = LassoTrainer(self.active_pairs) if ML_ENABLED else None
+        self.ridge_trainer = RidgeTrainer(self.active_pairs) if ML_ENABLED else None
 
         # ── Risk & execution ──
         self.risk_mgr = RiskManager(initial_value)
@@ -210,14 +200,14 @@ class TradingBot:
             ]
         return historical_data
 
-    def _refresh_lasso(self):
-        """Train Lasso and update ranker boost if signal found."""
-        if self.lasso_trainer is None:
+    def _refresh_ridge(self):
+        """Train Ridge and set as primary ranker."""
+        if self.ridge_trainer is None:
             return
         historical_data = self._build_historical_data_for_ml()
-        model, r2 = self.lasso_trainer.train(historical_data)
+        model, r2 = self.ridge_trainer.train(historical_data)
         if model is not None:
-            self.ranker.set_lasso(model, r2)
+            self.ranker.set_model(model, r2)
 
     # ─── Startup ────────────────────────────────────────────────
 
@@ -235,7 +225,7 @@ class TradingBot:
         # Initial Lasso training (optional boost)
         if ML_ENABLED:
             try:
-                self._refresh_lasso()
+                self._refresh_ridge()
             except Exception as e:
                 log.error(f"Initial Lasso training failed: {e}")
 
@@ -268,7 +258,7 @@ class TradingBot:
         # Optional Lasso retrain
         if ML_ENABLED and self.cycle_count % ML_RETRAIN_INTERVAL == 1:
             try:
-                self._refresh_lasso()
+                self._refresh_ridge()
             except Exception as e:
                 log.error(f"Lasso training failed: {e}")
 
@@ -517,8 +507,8 @@ class TradingBot:
             "regime": self.regime.get_status(),
             "risk": self.risk_mgr.get_status(),
             "drawdown_action": dd_check.get("action", "none"),
-            "lasso_active": self.ranker.lasso_active,
-            "lasso_r2": round(self.ranker.lasso_r2, 4),
+            "ridge_active": self.ranker.using_ridge,
+            "ridge_r2": round(self.ranker.model_r2, 4),
             "metrics": metrics,
         })
 

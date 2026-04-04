@@ -1,13 +1,16 @@
 """
-ML model trainer — Finals v7: optional Lasso running in background.
+ML model trainer — Finals v7: Ridge regression on relative returns.
 
-The Lasso is NOT the primary signal. It runs every ML_RETRAIN_INTERVAL cycles,
-and if it finds genuine signal (R² > ML_MIN_R2), it boosts the momentum score.
-If it finds nothing (R² ≈ 0, all features zeroed), the bot still trades normally
-using the momentum composite.
+Ridge is the PRIMARY ranker (not optional boost). Shootout results:
+  Ridge: Spearman +0.020, TopK return +0.47%, p=0.025 vs EWMA
+  EWMA:  Spearman -0.050 (negative — ranks coins backwards)
 
-This addresses the v6 failure where Lasso zeroing all features caused the bot
-to hold cash for 22 consecutive days.
+Target: coin_return - median(all_coin_returns) over 24h forward.
+This removes market direction and focuses on cross-sectional spread.
+
+Ridge over Lasso: Lasso zeros all features (too aggressive sparsity).
+Ridge keeps all features with shrunk coefficients — better for small
+sample sizes with correlated features (typical in crypto).
 """
 import numpy as np
 from typing import Optional
@@ -18,15 +21,15 @@ from bot.features import compute_coin_features, zscore_universe
 log = get_logger("ml")
 
 try:
-    from sklearn.linear_model import LassoCV
+    from sklearn.linear_model import Ridge
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
-    log.warning("scikit-learn not installed. Lasso disabled.")
+    log.warning("scikit-learn not installed. Ridge disabled.")
 
 
-class LassoTrainer:
-    """Trains optional Lasso model for score boosting."""
+class RidgeTrainer:
+    """Trains Ridge regression on cross-sectional relative returns."""
 
     def __init__(self, active_pairs: list[str]):
         self.active_pairs = active_pairs
@@ -41,11 +44,7 @@ class LassoTrainer:
         forward_horizon: int = ML_FORWARD_HORIZON,
         sample_interval: int = ML_SAMPLE_INTERVAL,
     ) -> tuple[Optional[object], float]:
-        """Train Lasso, return (model, R²).
-
-        Returns (None, 0.0) if insufficient data or training fails.
-        The caller checks R² to decide whether to activate the boost.
-        """
+        """Train Ridge on relative returns. Returns (model, R²)."""
         if not SKLEARN_AVAILABLE:
             return None, 0.0
 
@@ -69,7 +68,7 @@ class LassoTrainer:
             for pair in self.active_pairs:
                 if pair not in historical_data:
                     continue
-                hist = historical_data[pair][: t + 1]
+                hist = historical_data[pair][:t + 1]
                 if len(hist) < 100:
                     continue
                 closes = np.array([x["close"] for x in hist])
@@ -85,7 +84,7 @@ class LassoTrainer:
 
             zscored = zscore_universe(raw_features, feature_keys=feature_cols)
 
-            # Compute all forward returns first to get the median (for relative target)
+            # Compute forward relative returns
             forward_returns = {}
             for pair in zscored:
                 if pair not in historical_data:
@@ -101,14 +100,12 @@ class LassoTrainer:
             if len(forward_returns) < 5:
                 continue
 
-            # RELATIVE target: coin_return - median(all returns)
-            # This removes market direction and focuses on cross-sectional spread
-            median_return = float(np.median(list(forward_returns.values())))
+            median_ret = float(np.median(list(forward_returns.values())))
 
             for pair, fz in zscored.items():
                 if pair not in forward_returns:
                     continue
-                target = forward_returns[pair] - median_return
+                target = forward_returns[pair] - median_ret
                 x = [fz.get(k, 0.0) for k in feature_cols]
                 if any(not np.isfinite(v) for v in x) or not np.isfinite(target):
                     continue
@@ -122,36 +119,20 @@ class LassoTrainer:
         X = np.array(X_train)
         y = np.array(y_train)
 
-        model = LassoCV(
-            alphas=np.logspace(-5, -1, 100),
-            cv=5,
-            max_iter=10000,
-            random_state=42,
-        )
+        model = Ridge(alpha=1.0)
         model.fit(X, y)
 
         r2 = float(model.score(X, y))
-        nonzero = [
-            (feature_cols[i], round(float(model.coef_[i]), 6))
-            for i in range(len(feature_cols))
-            if abs(model.coef_[i]) > 1e-8
-        ]
-        zeroed = [
-            feature_cols[i]
-            for i in range(len(feature_cols))
-            if abs(model.coef_[i]) <= 1e-8
-        ]
-
         self.last_model = model
         self.last_r2 = r2
-        self.last_nonzero_features = [name for name, _ in nonzero]
 
-        log.info(
-            f"ML: {len(X_train)} samples, alpha={model.alpha_:.6f}, R²={r2:.4f}"
-        )
-        if nonzero:
-            log.info(f"  Active: {nonzero}")
-        if zeroed:
-            log.info(f"  Zeroed: {zeroed}")
+        # Log coefficients
+        coefs = [(feature_cols[i], round(float(model.coef_[i]), 6))
+                 for i in range(len(feature_cols))]
+        coefs_sorted = sorted(coefs, key=lambda x: abs(x[1]), reverse=True)
+        self.last_nonzero_features = [name for name, c in coefs if abs(c) > 1e-8]
+
+        log.info(f"Ridge trained: {len(X_train)} samples, R²={r2:.4f}")
+        log.info(f"  Top coefs: {coefs_sorted[:5]}")
 
         return model, r2

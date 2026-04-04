@@ -116,11 +116,16 @@ REDD_MAX_DD = 0.10
 USE_LIMIT_ORDERS = True
 LIMIT_ORDER_OFFSET_BPS = 1
 
-# --- Optional ML (Lasso on RELATIVE returns — cross-sectional ranking) ---
-# Target: coin_return - median(all_coin_returns) over forward horizon.
-# This removes market direction (unpredictable) and focuses on cross-sectional spread.
-# When Lasso finds signal (R² > 0.5%), it boosts the EWMA score.
-ML_ENABLED = True
+# --- ML: Ridge for RANK AVERAGING (not magnitude blending) ---
+# Ridge has significant ranking ability (Spearman +0.020, p=0.025) but
+# noisy magnitudes (R² 1-4%). Score blending hurt (48% → 38% positive).
+# Solution: use Ridge for RANKING only via rank averaging.
+#   1. EWMA ranks coins by momentum
+#   2. Ridge ranks coins by predicted relative return
+#   3. Combined rank = average of two ranks
+#   4. Trade by combined rank, size by EWMA magnitude
+# This preserves Ridge's cross-sectional signal without its magnitude noise.
+ML_ENABLED = False
 ML_LOOKBACK_HOURS = 400
 ML_FORWARD_HORIZON = 24
 ML_SAMPLE_INTERVAL = 24
