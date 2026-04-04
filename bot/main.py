@@ -350,8 +350,15 @@ class TradingBot:
         all_zscored = zscore_universe(all_raw_features)
 
         # ── STEP 3+4: RANK + GATE ──
+        # Build closes dict for EWMA computation
+        closes_dict = {}
+        for pair in all_raw_features:
+            closes = self.binance.get_closes(pair)
+            if closes is not None and len(closes) > 30:
+                closes_dict[pair] = closes
+
         held_pairs = {p for p, q in self.positions.items() if q > 0}
-        ranked = self.ranker.rank(all_raw_features, all_zscored, held_pairs)
+        ranked = self.ranker.rank(all_raw_features, all_zscored, held_pairs, closes_dict)
 
         # ── STEP 6 (before entries): EXIT MANAGEMENT ──
         self._check_exits(ticker_data)

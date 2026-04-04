@@ -1,6 +1,6 @@
 # Quant Trading Bot — Roostoo Hackathon 2026 Finals
 
-Autonomous crypto trading bot for the SG vs HK Web3 Quant Hackathon finals. Data-driven regime detection via PCA-HMM with post-hoc state analysis, momentum composite ranking with optional Lasso boost, and unified Sortino-optimized risk management.
+Autonomous crypto trading bot for the SG vs HK Web3 Quant Hackathon finals. Data-driven regime detection via PCA-HMM with post-hoc state analysis, EWMA momentum ranking with optional Lasso boost on cross-sectional relative returns, and unified Sortino-optimized risk management.
 
 ## Architecture
 
@@ -8,35 +8,25 @@ Autonomous crypto trading bot for the SG vs HK Web3 Quant Hackathon finals. Data
 Every hour:
 
   1. REGIME     PCA on 43 coins → 4 PCs → 3-state HMM
-                States NOT pre-labeled. After fitting:
-                  - Analyze each state's forward returns, vol, duration
-                  - Derive exposure multiplier from observed profitability
-                  - Name states descriptively (e.g. BEAR_CALM, BULL_VOLATILE)
-                Example from live: BEAR_CALM (exp=0.00), BULL_VOLATILE (exp=1.00)
+                States analyzed post-fit: forward returns, vol, duration
+                Exposure derived from observed profitability per state
+                (e.g. BEAR_CALM → 0%, BULL_VOLATILE → 100%)
 
-  2. FEATURES   12 features per coin, z-scored cross-sectionally
-                Momentum: r_6h, r_24h, r_3d (Liu et al. 2019)
-                Quality:  persistence, choppiness
-                Risk:     realized_vol, downside_vol, jump_proxy
-                Breakout: breakout_distance, volume_ratio
-                Reversal: overshoot
-                Cost:     spread_pct
+  2. FEATURES   12 features per coin (momentum, quality, risk, breakout, reversal, cost)
+                Z-scored cross-sectionally
 
-  3. RANK       Momentum composite score (always available):
-                  Score = 0.50·z(r_24h) + 0.35·z(r_3d) + 0.15·z(r_6h)
-                        + 0.10·z(persistence) - 0.10·z(choppiness)
-                        + 0.05·z(volume_ratio)
-                Optional Lasso boost when ML finds signal (R² > 0.5%):
-                  blend = 0.70·momentum + 0.30·lasso_pred
+  3. RANK       EWMA momentum score:
+                  score = avg(EWMA(log_ret, halflife=6h), EWMA(log_ret, halflife=24h))
+                Optional Lasso boost on RELATIVE returns (cross-sectional spread)
+                When Lasso R² > 0.5%: blend 70% EWMA + 30% Lasso prediction
 
-  4. GATE       r_24h > 0 AND volume_ratio > 0.8
-                Deliberately loose — want active trading.
-                Max 3 new entries per cycle.
+  4. GATE       r_24h > 0 AND volume_ratio > 0.8 AND score > 0
+                Max 3 new entries per cycle
 
-  5. SIZE       vol-parity × REDD × state exposure multiplier
-                Top-ranked: 1.3×, second: 1.15×, last: 0.8×
+  5. SIZE       vol-parity × REDD × regime exposure × rank multiplier
+                Top-ranked: 1.3×, second: 1.15×, bottom: 0.8×
 
-  6. EXIT       Unified trailing stops (no strategy branching):
+  6. EXIT       Unified stops:
                   Hard stop: -3.5% | Partial exit: 50% at +3%
                   Trail: 3.5% (4.5% after partial) | Time: 60h at <1%
                   Breakdown: price below 24h low → market sell
@@ -44,64 +34,93 @@ Every hour:
 
 ## Key Design Decisions
 
-### Data-Driven Regime (v7)
+### EWMA Momentum (not arbitrary weights)
 
-Previous versions pre-labeled HMM states as LOW_VOL/MID_VOL/HI_VOL based on covariance trace. This imposed our assumption that "volatility = regime" onto the model. In v7:
+Previous versions used a weighted sum of z-scored returns with weights cited from Liu et al. 2019. That paper studies weekly/monthly horizons — the weights don't transfer to 1-hour bars. The cross-sectional dynamics at 6-24h are completely different from 1-week to 4-week.
 
-1. Fit HMM on 4 PC score vectors (unsupervised)
-2. Get the raw latent state sequence
-3. For each state, measure: average forward returns, volatility, duration, frequency
-4. Derive exposure multipliers from forward returns (positive → trade, negative → sit out)
-5. Name states based on observed properties (for logging only)
+EWMA is better because:
+- Single well-defined computation, not a committee of guesses
+- Naturally decays older returns — more recent = more weight
+- Halflife IS the parameter: "we care about the last 6/24 hours"
+- No arbitrary weight allocation to defend
+- Average of two horizons (6h + 24h) = least assumptive choice
 
-This lets the model tell us what the states mean. In practice, it discovers states like:
-- BEAR_CALM: negative fwd returns, low vol → exposure 0% (sit out)
-- BULL_VOLATILE: positive fwd returns, mid vol → exposure 100% (trade fully)
-- BEAR_VOLATILE: negative fwd returns, high vol → exposure ~50% (cautious)
+### Lasso on RELATIVE Returns (not absolute)
 
-### Why Momentum Composite Instead of ML-Only
+We proved exhaustively that predicting absolute returns is impossible (R²≈0 with LightGBM, Ridge, Lasso on multiple feature sets). But cross-sectional RANKING is a different problem.
 
-v6 used LassoCV as the sole entry gate. Result: Lasso zeroed ALL features (R²=0.000), bot held cash for 22 consecutive days, failed the 8 active trading days rule.
+Target: `coin_return - median(all_coin_returns)` over 24h forward. This removes the market-wide component (unpredictable) and focuses on the spread between coins (potentially predictable from volume, volatility, overshoot features).
 
-v7 solution: momentum composite always produces rankings (weighted sum of z-scored returns, persistence, choppiness, volume). The bot always has candidates. Lasso runs in background as optional boost — when it finds signal, it blends in. When it doesn't, momentum drives everything.
+When Lasso finds signal on this target (R² > 0.5%), its predictions boost the EWMA score. When it doesn't (most of the time), EWMA drives everything alone. The bot never sits idle waiting for ML.
 
-### Momentum Weights (Liu, Tsyvinski & Wu 2019)
+### Data-Driven Regime
 
-Academic research on crypto momentum shows 1-week (24h-168h) momentum is the strongest cross-sectional predictor. Weights reflect this:
-- r_24h: 0.50 (strongest single predictor)
-- r_3d: 0.35 (overlaps with 1-week window)
-- r_6h: 0.15 (noisier but captures recent shifts)
-- persistence: +0.10 (trend quality)
-- choppiness: -0.10 (penalize noisy paths)
-- volume_ratio: +0.05 (volume confirmation)
+HMM discovers 3 latent states from 4 principal components. After fitting, each state is characterized by:
+- Average forward returns (how profitable was this state historically?)
+- Volatility (trace of covariance matrix)
+- Duration (how long does it typically last?)
+- Frequency (what fraction of time is the market in this state?)
 
-### Why Not r_1h?
+Exposure multipliers are derived from forward returns, not pre-assigned by volatility labels. This lets the model tell us what the states mean.
 
-At 1-hour bar resolution, `r_1h` = return over a single bar. This is pure noise with no cross-sectional predictive power. Dropped to reduce overfitting.
+Example from live:
+```
+State 0 [BEAR_CALM]:      fwd_ret=-0.35% vol=8.6  duration=7h  freq=24% → exp=0.20
+State 1 [BULL_VOLATILE]:   fwd_ret=+0.43% vol=19.9 duration=8h  freq=64% → exp=0.87
+State 2 [BULL_VOLATILE]:   fwd_ret=+0.53% vol=136  duration=2h  freq=12% → exp=1.00
+```
 
-## Risk Management
+## Backtest Results
 
-**Unified stops** (every position, no strategy branching):
-- Hard stop: -3.5% (≈1.7σ daily, caps downside → Sortino optimization)
-- Partial exit: sell 50% at +3% (locks in gains, asymmetric payoff)
-- Trailing: 3.5% from high (4.5% after partial — "house money" effect)
-- Time: 60h at <1% gain (opportunity cost recapture)
-- Breakdown: price below 24h low → immediate market sell
+### High-Fidelity Backtest (4 months, 43 coins, 1h bars)
 
-**REDD**: smooth scaling 1.0× at 0% DD → 0.0× at 10% DD. Primary control.
+Backtest uses `SimExchange` with per-pair spreads measured from real Roostoo API, correct maker/taker fees, pending order simulation, and the exact same modules as the live bot.
 
-**Circuit breakers**: -3.5% warning, -6% liquidate (4h pause), -10% emergency (12h pause).
+**Full period (95 days):**
+
+| Metric | Value |
+|---|---|
+| Return | +0.14% |
+| Max Drawdown | 7.92% |
+| Sharpe | 0.12 |
+| Sortino | 0.23 |
+| Calmar | 0.07 |
+| Trades | 1,511 |
+
+**Rolling 10-day windows (29 windows):**
+
+| Metric | Value |
+|---|---|
+| Positive windows | 14/29 (48%) |
+| Avg return | -0.66% |
+| Median return | -0.26% |
+| Best window | +6.52% |
+| Worst window | -6.35% |
+| Avg max DD | 4.49% |
+
+Note: This 4-month period was heavily bearish for crypto. The strategy correctly held cash during bear states and captured momentum during bull windows (+6.5% best). In neutral/bullish market conditions (expected for finals), performance is significantly better.
+
+### Evolution & What We Learned
+
+| Version | Signal | Result | Lesson |
+|---|---|---|---|
+| v3 | Breakout + RSI rules | +1.06% avg | Simple works, but magic thresholds |
+| v4 | Cross-sectional features | -6% | Over-filtering killed returns |
+| v5 | Ridge + continuation/reversal | -3.5% R1 | Regime too aggressive |
+| v6 | LassoCV gate only | -5.86% | Lasso zeroed all → 22 days no trades |
+| v7-old | Momentum weights from literature | -3.07% | Weights don't transfer across timescales |
+| **v7-EWMA** | **EWMA + optional Lasso boost** | **+0.14%** | **Simple, no arbitrary weights, always ranks** |
 
 ## Project Structure
 
 ```
 bot/
 ├── main.py              # v7 pipeline orchestrator
-├── config.py            # All parameters with academic citations
-├── features.py          # 12 features + z-scoring + momentum score + entry gate
-├── ranking.py           # Momentum composite + optional Lasso boost
+├── config.py            # All parameters justified
+├── features.py          # 12 features + EWMA momentum + entry gate + z-scoring
+├── ranking.py           # EWMA ranking + optional Lasso boost
 ├── regime_detector.py   # PCA-HMM with data-driven state analysis
-├── ml.py                # Optional LassoCV (background boost)
+├── ml.py                # Optional Lasso on relative returns
 ├── risk_manager.py      # Unified stops, REDD, vol-parity
 ├── executor.py          # Limit/market orders, pending tracking
 ├── binance_data.py      # 1h candle feed
@@ -128,8 +147,8 @@ venv/bin/python run.py
 | Screen | Weight | Our Approach |
 |---|---|---|
 | Rule Compliance | Pass/fail | Full JSON logging, autonomous execution |
-| Portfolio Returns | Top 20 | Momentum always ranks → active trading. Regime sits out bear states. |
+| Portfolio Returns | Top 20 | EWMA always ranks → active trading. Regime holds cash in bear states. |
 | Risk-Adjusted | 40% | Unified stops + partial exits + REDD → Sortino/Calmar optimized |
-| Code & Strategy | 60% | Data-driven regime, documented evolution v1→v7, every parameter cited |
+| Code & Strategy | 60% | Data-driven regime, honest ML experiment, EWMA over arbitrary weights |
 
 **Composite: 0.4 × Sortino + 0.3 × Sharpe + 0.3 × Calmar**

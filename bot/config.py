@@ -71,25 +71,13 @@ PCA_REFIT_INTERVAL_HOURS = 6
 # characterizing each state's profitability).
 STATE_ANALYSIS_FORWARD_HOURS = 24
 
-# --- Momentum Composite Score ---
-# Weights for the cross-sectional ranking score.
-# Applied to Z-SCORED features so all are on the same scale.
-#
-# Weight justification:
-#   r_24h (0.50): strongest single cross-sectional predictor in crypto
-#   r_3d  (0.35): captures medium-term trend, overlaps with 1-week momentum
-#   r_6h  (0.15): short-term momentum shift, noisier but captures recent moves
-#   persistence (+0.10): higher = more internally consistent trend
-#   choppiness (-0.10): lower = cleaner path (less noise)
-#   volume_ratio (+0.05): volume confirmation of move (proven in v3 backtest)
-SCORE_WEIGHTS = {
-    "r_6h": 0.15,
-    "r_24h": 0.50,
-    "r_3d": 0.35,
-    "persistence": 0.10,
-    "choppiness": -0.10,
-    "volume_ratio": 0.05,
-}
+# --- EWMA Momentum ---
+# Two EWMA horizons averaged. No arbitrary weight allocation.
+# EWMA smooths noise, weights recent hours exponentially, decays older hours.
+# Halflife IS the parameter — grounded in "we care about the last 6-24 hours."
+# Equal average of two horizons = least assumptive choice.
+EWMA_HALFLIFE_SHORT = 6    # 6-hour EWMA — captures short-term shifts
+EWMA_HALFLIFE_LONG = 24    # 24-hour EWMA — captures daily momentum
 
 # Entry gate (simple binary conditions on RAW features, not z-scored):
 #   r_24h > 0: only buy coins with positive 24h momentum
@@ -128,15 +116,15 @@ REDD_MAX_DD = 0.10
 USE_LIMIT_ORDERS = True
 LIMIT_ORDER_OFFSET_BPS = 1
 
-# --- Optional ML (Lasso runs in background, boosts score when it finds signal) ---
+# --- Optional ML (Lasso on RELATIVE returns — cross-sectional ranking) ---
+# Target: coin_return - median(all_coin_returns) over forward horizon.
+# This removes market direction (unpredictable) and focuses on cross-sectional spread.
+# When Lasso finds signal (R² > 0.5%), it boosts the EWMA score.
 ML_ENABLED = True
 ML_LOOKBACK_HOURS = 400
 ML_FORWARD_HORIZON = 24
 ML_SAMPLE_INTERVAL = 24
 ML_RETRAIN_INTERVAL = 6
-# When Lasso has signal, blend its prediction into the score.
-# blend_score = (1 - ML_BLEND_WEIGHT) * momentum_score + ML_BLEND_WEIGHT * lasso_pred
-# Only active when Lasso R² > ML_MIN_R2 (i.e., model actually found something).
 ML_BLEND_WEIGHT = 0.3
 ML_MIN_R2 = 0.005
 

@@ -248,9 +248,14 @@ class BacktestEngine:
 
                 all_z = zscore_universe(all_raw)
 
-                # ── Step 3+4: Rank (momentum composite + gate) ──
+                # ── Step 3+4: Rank (EWMA momentum + gate) ──
+                closes_dict = {}
+                for pair in all_raw:
+                    candles = self.all_candles[pair][:t + 1]
+                    closes_dict[pair] = np.array([c["close"] for c in candles])
+
                 held = {p for p, q in positions.items() if q > 0}
-                ranked = ranker.rank(all_raw, all_z, held)
+                ranked = ranker.rank(all_raw, all_z, held, closes_dict)
 
                 # ── Step 6 (before entries): Exits ──
                 self._check_exits(positions, ticker_data, risk_mgr, executor, result, t)

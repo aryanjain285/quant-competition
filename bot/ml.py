@@ -84,18 +84,31 @@ class LassoTrainer:
                 continue
 
             zscored = zscore_universe(raw_features, feature_keys=feature_cols)
-            for pair, fz in zscored.items():
+
+            # Compute all forward returns first to get the median (for relative target)
+            forward_returns = {}
+            for pair in zscored:
                 if pair not in historical_data:
                     continue
                 future_idx = t + forward_horizon
                 if future_idx >= len(historical_data[pair]):
                     continue
-                current_price = historical_data[pair][t]["close"]
-                future_price = historical_data[pair][future_idx]["close"]
-                if current_price <= 0:
-                    continue
+                cp = historical_data[pair][t]["close"]
+                fp = historical_data[pair][future_idx]["close"]
+                if cp > 0:
+                    forward_returns[pair] = (fp - cp) / cp
 
-                target = (future_price - current_price) / current_price
+            if len(forward_returns) < 5:
+                continue
+
+            # RELATIVE target: coin_return - median(all returns)
+            # This removes market direction and focuses on cross-sectional spread
+            median_return = float(np.median(list(forward_returns.values())))
+
+            for pair, fz in zscored.items():
+                if pair not in forward_returns:
+                    continue
+                target = forward_returns[pair] - median_return
                 x = [fz.get(k, 0.0) for k in feature_cols]
                 if any(not np.isfinite(v) for v in x) or not np.isfinite(target):
                     continue

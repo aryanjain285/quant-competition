@@ -11,10 +11,7 @@ v7 additions:
 """
 import numpy as np
 from typing import Optional
-from bot.config import (
-    ANNUALIZATION_FACTOR, MOMENTUM_LOOKBACKS, SCORE_WEIGHTS,
-    GATE_MIN_R24H, GATE_MIN_VOLUME_RATIO,
-)
+from bot.config import ANNUALIZATION_FACTOR, MOMENTUM_LOOKBACKS
 
 
 def _safe_div(a: float, b: float, default: float = 0.0) -> float:
@@ -234,25 +231,38 @@ def zscore_universe(
 # MOMENTUM COMPOSITE SCORE & ENTRY GATE
 # ═══════════════════════════════════════════════════════════════
 
-def compute_momentum_score(zscored_features: dict) -> float:
-    """Compute weighted momentum composite from z-scored features.
+def compute_ewma_momentum(closes: np.ndarray) -> float:
+    """Compute EWMA momentum score from close prices.
 
-    Uses z-scored values so all features are on the same scale.
-    The score is unit-free — it's a weighted sum of z-scores.
-    Higher = better candidate for buying.
+    score = average of EWMA(log_returns, halflife=6h) and EWMA(log_returns, halflife=24h)
 
-    Weights from SCORE_WEIGHTS in config.py:
-        r_6h:  0.15  (short-term shift)
-        r_24h: 0.50  (core momentum signal)
-        r_3d:  0.35  (medium-term trend)
-        persistence: +0.10  (trend quality bonus)
-        choppiness:  -0.10  (noise penalty)
-        volume_ratio: +0.05  (volume confirmation)
+    EWMA naturally weights recent returns more. Halflife=24 means returns
+    from 24 hours ago have half the weight of the current hour.
+    No arbitrary weight allocation — just average two horizons.
+
+    Returns the averaged EWMA value (a smoothed recent log return rate).
     """
-    score = 0.0
-    for feature, weight in SCORE_WEIGHTS.items():
-        score += weight * zscored_features.get(feature, 0.0)
-    return score
+    from bot.config import EWMA_HALFLIFE_SHORT, EWMA_HALFLIFE_LONG
+
+    if len(closes) < EWMA_HALFLIFE_LONG + 5:
+        return 0.0
+
+    log_rets = np.diff(np.log(closes))
+    if len(log_rets) < EWMA_HALFLIFE_LONG:
+        return 0.0
+
+    # EWMA: alpha = 1 - exp(-ln(2)/halflife)
+    def _ewma_last(data, halflife):
+        alpha = 1.0 - np.exp(-np.log(2) / halflife)
+        val = data[0]
+        for x in data[1:]:
+            val = alpha * x + (1 - alpha) * val
+        return float(val)
+
+    ewma_short = _ewma_last(log_rets, EWMA_HALFLIFE_SHORT)
+    ewma_long = _ewma_last(log_rets, EWMA_HALFLIFE_LONG)
+
+    return (ewma_short + ewma_long) / 2.0
 
 
 def check_entry_gate(raw_features: dict) -> bool:
@@ -262,9 +272,10 @@ def check_entry_gate(raw_features: dict) -> bool:
     1. r_24h > 0: positive 24h momentum (don't buy declining coins)
     2. volume_ratio > 0.8: minimum volume activity
 
-    These are deliberately loose. The ranking score handles quality;
-    the gate just eliminates the obviously wrong entries.
+    These are deliberately loose. The EWMA ranking handles quality;
+    the gate just eliminates obviously wrong entries.
     """
+    from bot.config import GATE_MIN_R24H, GATE_MIN_VOLUME_RATIO
     if raw_features.get("r_24h", 0) <= GATE_MIN_R24H:
         return False
     if raw_features.get("volume_ratio", 0) < GATE_MIN_VOLUME_RATIO:

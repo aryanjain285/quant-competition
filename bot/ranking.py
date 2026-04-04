@@ -1,22 +1,26 @@
 """
-Ranker v7: momentum composite ranking with optional ML boost.
+Ranker v7: EWMA momentum ranking with optional Lasso boost.
 
-Primary signal: weighted momentum score (always available, always produces rankings).
-ML boost: if Lasso has signal (R² > threshold), blend its prediction into the score.
+Primary signal: EWMA momentum score (always available, always ranks coins).
+  score = average(EWMA(log_returns, halflife=6h), EWMA(log_returns, halflife=24h))
 
-This ensures the bot always trades (momentum score always ranks coins),
-while still benefiting from ML when it finds genuine signal.
+ML boost: when Lasso on RELATIVE returns finds signal (R² > 0.5%),
+  blend its cross-sectional prediction into the EWMA score.
+
+Entry gate: r_24h > 0 AND volume_ratio > 0.8.
+  Deliberately loose — ranking handles quality.
 """
+import numpy as np
 from typing import Optional
-from bot.config import LASSO_FEATURES, ML_BLEND_WEIGHT, ML_MIN_R2
-from bot.features import compute_momentum_score, check_entry_gate
+from bot.config import ML_BLEND_WEIGHT, ML_MIN_R2, LASSO_FEATURES
+from bot.features import compute_ewma_momentum, check_entry_gate
 from bot.logger import get_logger
 
 log = get_logger("ranking")
 
 
 class Ranker:
-    """Ranks coins by momentum composite score with optional Lasso boost."""
+    """Ranks coins by EWMA momentum with optional Lasso boost."""
 
     def __init__(self):
         self.lasso_model = None
@@ -24,7 +28,7 @@ class Ranker:
         self.lasso_active: bool = False
 
     def set_lasso(self, model, r2: float):
-        """Hot-swap Lasso model. Only activates boost if R² exceeds threshold."""
+        """Hot-swap Lasso. Only activates boost if R² exceeds threshold."""
         self.lasso_model = model
         self.lasso_r2 = r2
         self.lasso_active = r2 >= ML_MIN_R2
@@ -33,11 +37,14 @@ class Ranker:
         else:
             log.info(f"Lasso boost OFF (R²={r2:.4f} < {ML_MIN_R2})")
 
-    def _lasso_predict(self, zscored: dict) -> Optional[float]:
-        """Get Lasso predicted return for one coin."""
+    def has_model(self) -> bool:
+        """Whether the ranker can produce rankings (always True — EWMA is always available)."""
+        return True
+
+    def _lasso_predict_one(self, zscored: dict) -> Optional[float]:
+        """Get Lasso predicted relative return for one coin."""
         if not self.lasso_active or self.lasso_model is None:
             return None
-        import numpy as np
         x = [zscored.get(k, 0.0) for k in LASSO_FEATURES]
         if any(not np.isfinite(v) for v in x):
             return None
@@ -48,65 +55,64 @@ class Ranker:
         raw_features: dict[str, dict],
         zscored_features: dict[str, dict],
         held_pairs: set[str] = None,
+        closes_dict: dict[str, np.ndarray] = None,
     ) -> list[tuple[str, float, dict]]:
-        """Rank all coins and filter by entry gate.
+        """Rank all coins by EWMA momentum and filter by entry gate.
 
         Args:
-            raw_features: {pair: {raw feature values}} for gate checks
-            zscored_features: {pair: {z-scored feature values}} for scoring
+            raw_features: {pair: raw features} for gate checks
+            zscored_features: {pair: z-scored features} for Lasso boost
             held_pairs: pairs currently held (skip re-entry)
+            closes_dict: {pair: np.ndarray of closes} for EWMA computation
 
         Returns:
             List of (pair, score, raw_features) sorted by score desc.
-            Only includes coins that pass the entry gate AND are not held.
         """
         held_pairs = held_pairs or set()
+        closes_dict = closes_dict or {}
         candidates = []
 
-        for pair in zscored_features:
-            # Skip if already holding
+        for pair in raw_features:
             if pair in held_pairs:
                 continue
 
-            raw = raw_features.get(pair)
-            if raw is None:
-                continue
+            raw = raw_features[pair]
 
-            # Entry gate (simple binary conditions on raw features)
+            # Entry gate
             if not check_entry_gate(raw):
                 continue
 
-            zs = zscored_features[pair]
-
-            # Primary score: momentum composite
-            momentum_score = compute_momentum_score(zs)
-
-            # Optional ML boost
-            lasso_pred = self._lasso_predict(zs)
-            if lasso_pred is not None:
-                # Blend: (1-w)*momentum + w*lasso_pred (normalized)
-                # Normalize lasso_pred to similar scale as momentum_score
-                # momentum_score is in z-score units (~[-3, 3])
-                # lasso_pred is in return units (~[-0.05, 0.05])
-                # Scale lasso by 20 to bring into similar range
-                lasso_scaled = lasso_pred * 20
-                score = (1 - ML_BLEND_WEIGHT) * momentum_score + ML_BLEND_WEIGHT * lasso_scaled
+            # EWMA momentum score
+            closes = closes_dict.get(pair)
+            if closes is not None and len(closes) > 30:
+                ewma_score = compute_ewma_momentum(closes)
             else:
-                score = momentum_score
+                # Fallback: use raw 24h return as proxy
+                ewma_score = raw.get("r_24h", 0.0)
 
-            # Only keep positive-scoring candidates
+            if ewma_score <= 0:
+                continue
+
+            # Optional Lasso boost on cross-sectional relative returns
+            zs = zscored_features.get(pair, {})
+            lasso_pred = self._lasso_predict_one(zs)
+            if lasso_pred is not None:
+                # Scale lasso prediction to similar magnitude as EWMA score
+                # EWMA score is in log-return units (~0.001 to 0.01 typically)
+                score = (1 - ML_BLEND_WEIGHT) * ewma_score + ML_BLEND_WEIGHT * lasso_pred
+            else:
+                score = ewma_score
+
             if score > 0:
                 candidates.append((pair, score, raw))
 
-        # Sort by score, highest first
         candidates.sort(key=lambda x: x[1], reverse=True)
 
         if candidates:
-            top = candidates[0]
             log.info(
                 f"Ranked {len(candidates)} candidates. "
-                f"Top: {top[0]} (score={top[1]:.4f}) "
-                f"{'[+Lasso]' if self.lasso_active else '[momentum only]'}"
+                f"Top: {candidates[0][0]} (score={candidates[0][1]:.6f}) "
+                f"{'[+Lasso]' if self.lasso_active else '[EWMA only]'}"
             )
 
         return candidates
