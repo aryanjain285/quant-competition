@@ -257,12 +257,13 @@ The backtest calls the exact same functions as `main.py`. Only the exchange inte
 
 | Metric | Value |
 |---|---|
-| Return | -5.23% |
+| Return | -5.92% |
 | Positive 10-day windows | 16/49 (33%) |
-| Best 10-day window | +7.73% |
-| Worst 10-day window | -5.84% |
+| Best 10-day window | **+9.80%** |
+| Worst 10-day window | -5.31% |
+| Avg max drawdown | 3.74% |
 
-The 6-month period includes an extended bearish stretch for crypto. A long-only momentum strategy cannot profit when the entire market drops — this is the fundamental constraint, not a strategy flaw. The bot correctly reduces exposure in bear states and captures trending bull windows (+7.7% best).
+The 6-month period includes an extended bearish stretch for crypto. The strategy's behavior is consistent across in-sample and out-of-sample: captures bull windows strongly (+9.80% best — highest across all tests) and limits bear losses (worst -5.31%, similar to in-sample). Average drawdown is actually LOWER on OOS (3.74% vs 4.16%) — the risk management generalizes. A long-only momentum strategy cannot profit when the entire market drops — this is the fundamental constraint, not a strategy flaw.
 
 ---
 
