@@ -1,12 +1,17 @@
 """
-Cross-sectional feature engine.
+Cross-sectional feature engine — Finals v7.
 
 ALL LOOKBACKS ARE IN 1-HOUR BARS. One bar = one hour.
 Annualization: sqrt(24 * 365) = sqrt(8760) ≈ 93.6 for hourly data.
+
+v7 additions:
+- compute_momentum_score(): weighted composite for ranking
+- check_entry_gate(): simple binary conditions for entry filtering
+- check_breakdown(): technical breakdown exit signal (moved from signals.py)
 """
 import numpy as np
 from typing import Optional
-from bot.config import ANNUALIZATION_FACTOR
+from bot.config import ANNUALIZATION_FACTOR, MOMENTUM_LOOKBACKS
 
 
 def _safe_div(a: float, b: float, default: float = 0.0) -> float:
@@ -25,6 +30,7 @@ def zscore_array(arr: np.ndarray) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════
 
 def compute_returns(closes: np.ndarray, lookbacks: dict[str, int]) -> dict[str, float]:
+    """Multi-horizon returns. Each lookback is in 1h bars."""
     result = {}
     for label, lb in lookbacks.items():
         if len(closes) > lb + 1 and closes[-(lb + 1)] > 0:
@@ -50,7 +56,7 @@ def compute_persistence(closes: np.ndarray, lookback: int = 24) -> float:
 
 
 def compute_choppiness(closes: np.ndarray, lookback: int = 24) -> float:
-    """Path noisiness. 0 = trending, 1 = choppy. 24 bars = 24h."""
+    """Path noisiness. 0 = pure trend, 1 = pure chop. 24 bars = 24h."""
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
     if lookback < 2:
@@ -62,7 +68,7 @@ def compute_choppiness(closes: np.ndarray, lookback: int = 24) -> float:
 
 
 def compute_realized_vol(closes: np.ndarray, lookback: int = 24) -> float:
-    """Annualized realized vol. 24 bars = 24h. Annualize with sqrt(8760)."""
+    """Annualized realized vol. 24 bars = 24h."""
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
     if lookback < 2:
@@ -72,7 +78,7 @@ def compute_realized_vol(closes: np.ndarray, lookback: int = 24) -> float:
 
 
 def compute_downside_vol(closes: np.ndarray, lookback: int = 24) -> float:
-    """Annualized downside vol. 24 bars = 24h."""
+    """Annualized downside vol. Sortino-relevant risk measure."""
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
     if lookback < 2:
@@ -83,7 +89,7 @@ def compute_downside_vol(closes: np.ndarray, lookback: int = 24) -> float:
 
 
 def compute_jump_proxy(closes: np.ndarray, lookback: int = 24) -> float:
-    """Max |return| / realized vol. Measures tail risk."""
+    """Max |return| / realized vol. Tail risk measure."""
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
     if lookback < 10:
@@ -93,26 +99,19 @@ def compute_jump_proxy(closes: np.ndarray, lookback: int = 24) -> float:
     return float(np.max(np.abs(log_rets)) / vol) if vol > 0 else 0.0
 
 
-def compute_risk_penalty(rv: float, dv: float, jp: float,
-                         a=0.25, b=0.45, c=0.30) -> float:
-    return a * rv + b * dv + c * jp
-
-
-def compute_cost_penalty(spread: float, short_vol: float,
-                         delta=0.60, gamma=0.40) -> float:
-    return delta * spread + gamma * short_vol
-
-
 def compute_breakout_distance(closes: np.ndarray, highs: np.ndarray, lookback: int = 72) -> float:
     """Distance above prior rolling high. 72 bars = 72h = 3 days."""
     if len(closes) < lookback + 1:
         return 0.0
-    prior_high = np.max(highs[-(lookback + 1):-1]) if len(highs) >= lookback + 1 else np.max(closes[-(lookback + 1):-1])
+    if len(highs) >= lookback + 1:
+        prior_high = np.max(highs[-(lookback + 1):-1])
+    else:
+        prior_high = np.max(closes[-(lookback + 1):-1])
     return (closes[-1] - prior_high) / prior_high if prior_high > 0 else 0.0
 
 
 def compute_volume_ratio(volumes: np.ndarray, lookback: int = 72) -> float:
-    """Recent volume (last 3 bars = 3h) vs lookback average. 72 bars = 72h."""
+    """Recent volume (last 3h) vs lookback average. Volume confirmation."""
     if len(volumes) < lookback + 3:
         return 1.0
     recent = np.mean(volumes[-3:])
@@ -121,12 +120,8 @@ def compute_volume_ratio(volumes: np.ndarray, lookback: int = 72) -> float:
 
 
 def compute_overshoot(closes: np.ndarray, lookback: int = 168) -> float:
-    """Z-score of 6h return vs distribution of 6h returns over lookback.
-
-    horizon = 6 bars (6h on 1h data).
-    lookback = 168 bars (7 days) for reference distribution.
-    """
-    horizon = 6  # 6 hours
+    """Z-score of 6h return vs distribution of 6h returns over lookback."""
+    horizon = 6
     if len(closes) < lookback + horizon:
         lookback = len(closes) - horizon - 1
     if lookback < horizon * 2:
@@ -148,9 +143,22 @@ def compute_overshoot(closes: np.ndarray, lookback: int = 168) -> float:
 
 
 def compute_spread_pct(bid: float, ask: float) -> float:
+    """Bid-ask spread as fraction of mid price."""
     if bid <= 0 or ask <= 0:
         return 0.0
     return (ask - bid) / ((bid + ask) / 2)
+
+
+def check_breakdown(closes: np.ndarray, lows: np.ndarray, lookback: int = 72) -> bool:
+    """Check if price has broken below recent low (exit signal)."""
+    if len(closes) < lookback + 1:
+        return False
+    breakdown_lb = max(lookback // 3, 6)
+    if len(lows) >= breakdown_lb + 1:
+        prior_low = np.min(lows[-breakdown_lb - 1:-1])
+    else:
+        prior_low = np.min(closes[-breakdown_lb - 1:-1])
+    return closes[-1] < prior_low and prior_low > 0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -160,56 +168,49 @@ def compute_spread_pct(bid: float, ask: float) -> float:
 def compute_coin_features(
     closes: np.ndarray, highs: np.ndarray, lows: np.ndarray,
     volumes: np.ndarray, bid: float, ask: float,
-    lookbacks: dict[str, int] = None, breakout_lookback: int = 72,
+    breakout_lookback: int = 72,
 ) -> Optional[dict]:
-    """Compute ALL raw features for one coin. All lookbacks in 1h bars."""
-    if lookbacks is None:
-        lookbacks = {"1h": 1, "6h": 6, "24h": 24, "3d": 72}
-
+    """Compute ALL raw features for one coin."""
     if len(closes) < 80:
         return None
     if closes[-1] <= 0:
         return None
 
-    rets = compute_returns(closes, lookbacks)
-    persist = compute_persistence(closes, 24)
-    choppy = compute_choppiness(closes, 24)
-    rv = compute_realized_vol(closes, 24)
-    dv = compute_downside_vol(closes, 24)
-    jump = compute_jump_proxy(closes, 24)
-    bo_dist = compute_breakout_distance(closes, highs, breakout_lookback)
-    vol_ratio = compute_volume_ratio(volumes, breakout_lookback)
-    overshoot = compute_overshoot(closes, 168)
-    spread = compute_spread_pct(bid, ask)
-
-    # Short-term vol (last 6h for cost penalty)
-    if len(closes) > 7:
-        lr = np.diff(np.log(closes[-7:]))
-        short_vol = float(np.std(lr)) * ANNUALIZATION_FACTOR if len(lr) > 0 else 0
-    else:
-        short_vol = 0
+    rets = compute_returns(closes, MOMENTUM_LOOKBACKS)
 
     return {
         **rets,
-        "persistence": persist, "choppiness": choppy,
-        "realized_vol": rv, "downside_vol": dv, "jump_proxy": jump,
-        "breakout_distance": bo_dist, "volume_ratio": vol_ratio,
-        "overshoot": overshoot, "spread_pct": spread, "short_vol": short_vol,
+        "persistence": compute_persistence(closes, 24),
+        "choppiness": compute_choppiness(closes, 24),
+        "realized_vol": compute_realized_vol(closes, 24),
+        "downside_vol": compute_downside_vol(closes, 24),
+        "jump_proxy": compute_jump_proxy(closes, 24),
+        "breakout_distance": compute_breakout_distance(closes, highs, breakout_lookback),
+        "volume_ratio": compute_volume_ratio(volumes, breakout_lookback),
+        "overshoot": compute_overshoot(closes, 168),
+        "spread_pct": compute_spread_pct(bid, ask),
         "price": closes[-1],
     }
 
 
 # ═══════════════════════════════════════════════════════════════
-# CROSS-SECTIONAL Z-SCORING + SUBMODELS + MARKET FEATURES
+# CROSS-SECTIONAL Z-SCORING
 # ═══════════════════════════════════════════════════════════════
 
-def zscore_universe(all_features: dict[str, dict], feature_keys: list[str] = None) -> dict[str, dict]:
+def zscore_universe(
+    all_features: dict[str, dict],
+    feature_keys: list[str] = None,
+) -> dict[str, dict]:
+    """Z-score features cross-sectionally across all coins."""
     if not all_features:
         return {}
     pairs = list(all_features.keys())
     if feature_keys is None:
         first = next(iter(all_features.values()))
-        feature_keys = [k for k, v in first.items() if isinstance(v, (int, float)) and k != "price"]
+        feature_keys = [
+            k for k, v in first.items()
+            if isinstance(v, (int, float)) and k != "price"
+        ]
 
     zscored = {p: {} for p in pairs}
     for key in feature_keys:
@@ -217,6 +218,8 @@ def zscore_universe(all_features: dict[str, dict], feature_keys: list[str] = Non
         z = zscore_array(vals)
         for i, p in enumerate(pairs):
             zscored[p][key] = float(z[i])
+
+    # Pass through non-numeric / excluded fields
     for p in pairs:
         for k, v in all_features[p].items():
             if k not in feature_keys:
@@ -224,24 +227,57 @@ def zscore_universe(all_features: dict[str, dict], feature_keys: list[str] = Non
     return zscored
 
 
-def compute_submodel_scores(zf: dict) -> dict:
-    zf["risk_penalty"] = round(compute_risk_penalty(
-        zf.get("realized_vol", 0), zf.get("downside_vol", 0), zf.get("jump_proxy", 0)), 4)
-    zf["cost_penalty"] = round(compute_cost_penalty(
-        zf.get("spread_pct", 0), zf.get("short_vol", 0)), 4)
-    return zf
+# ═══════════════════════════════════════════════════════════════
+# MOMENTUM COMPOSITE SCORE & ENTRY GATE
+# ═══════════════════════════════════════════════════════════════
+
+def compute_ewma_momentum(closes: np.ndarray) -> float:
+    """Compute EWMA momentum score from close prices.
+
+    score = average of EWMA(log_returns, halflife=6h) and EWMA(log_returns, halflife=24h)
+
+    EWMA naturally weights recent returns more. Halflife=24 means returns
+    from 24 hours ago have half the weight of the current hour.
+    No arbitrary weight allocation — just average two horizons.
+
+    Returns the averaged EWMA value (a smoothed recent log return rate).
+    """
+    from bot.config import EWMA_HALFLIFE_SHORT, EWMA_HALFLIFE_LONG
+
+    if len(closes) < EWMA_HALFLIFE_LONG + 5:
+        return 0.0
+
+    log_rets = np.diff(np.log(closes))
+    if len(log_rets) < EWMA_HALFLIFE_LONG:
+        return 0.0
+
+    # EWMA: alpha = 1 - exp(-ln(2)/halflife)
+    def _ewma_last(data, halflife):
+        alpha = 1.0 - np.exp(-np.log(2) / halflife)
+        val = data[0]
+        for x in data[1:]:
+            val = alpha * x + (1 - alpha) * val
+        return float(val)
+
+    ewma_short = _ewma_last(log_rets, EWMA_HALFLIFE_SHORT)
+    ewma_long = _ewma_last(log_rets, EWMA_HALFLIFE_LONG)
+
+    return (ewma_short + ewma_long) / 2.0
 
 
-def compute_market_features(all_raw: dict[str, dict]) -> dict:
-    if not all_raw:
-        return {"breadth": 0.5, "trend_strength": 0.0, "mkt_downside_vol": 0.0, "cost_stress": 0.0}
-    pairs = list(all_raw.keys())
-    r24h = [all_raw[p].get("r_24h", 0) for p in pairs]
-    dvs = [all_raw[p].get("downside_vol", 0) for p in pairs]
-    spreads = [all_raw[p].get("spread_pct", 0) for p in pairs]
-    return {
-        "breadth": round(sum(1 for r in r24h if r > 0) / len(pairs), 4),
-        "trend_strength": round(float(np.median(r24h)), 6),
-        "mkt_downside_vol": round(float(np.median(dvs)), 4),
-        "cost_stress": round(float(np.median(spreads)), 6),
-    }
+def check_entry_gate(raw_features: dict) -> bool:
+    """Simple binary gate on RAW (not z-scored) features.
+
+    Conditions:
+    1. r_24h > 0: positive 24h momentum (don't buy declining coins)
+    2. volume_ratio > 0.8: minimum volume activity
+
+    These are deliberately loose. The EWMA ranking handles quality;
+    the gate just eliminates obviously wrong entries.
+    """
+    from bot.config import GATE_MIN_R24H, GATE_MIN_VOLUME_RATIO
+    if raw_features.get("r_24h", 0) <= GATE_MIN_R24H:
+        return False
+    if raw_features.get("volume_ratio", 0) < GATE_MIN_VOLUME_RATIO:
+        return False
+    return True

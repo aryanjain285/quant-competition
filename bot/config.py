@@ -1,9 +1,25 @@
 """
-Configuration for the trading bot.
+Configuration for the trading bot — v8 finals.
 All tunable parameters in one place. Override via environment variables.
 
 ALL LOOKBACKS AND WINDOWS ARE IN 1-HOUR BARS.
-The bot fetches 1h candles from Binance. Every bar = 1 hour.
+
+v8 DESIGN PHILOSOPHY:
+- EWMA momentum ranking (no arbitrary weights — one param per horizon)
+- Dynamic spread filter (median-based, adapts to market conditions per cycle)
+- Data-driven regime: HMM states analyzed post-fit, exposure from forward returns
+  Linear interpolation with 0.10 floor (activity compliance)
+- No ML in ranking: tested 6 models in shootout, all hurt the full pipeline
+- Active trading to satisfy 8 active trading days rule
+- Every parameter justified by cost, statistics, or backtest evidence
+
+PARAMETER JUSTIFICATIONS:
+- EWMA halflives (6h, 24h): captures short-term shifts + daily momentum, averaged equally
+- Commission: 0.05% maker, 0.10% taker → 10-20 bps round trip
+- Vol-parity: standard risk budgeting
+- Trailing stops: calibrated to hourly crypto vol (~2% daily → 3.5% ≈ 1.7σ)
+- Exposure: linear from Sharpe with 0.10 floor (+2.45% backtest, best of all configs)
+- Dynamic spread: median-based, no hardcoded threshold, self-calibrating
 """
 import os
 
@@ -26,60 +42,114 @@ BASE_URL = os.getenv("ROOSTOO_BASE_URL", "https://mock-api.roostoo.com")
 BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
 BINANCE_FUTURES_URL = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com")
 
-# --- Timing (1h bars → 1h cycle) ---
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL", "3600"))  # 1 hour
+# --- Timing ---
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL", "3600"))
 LIMIT_ORDER_TIMEOUT_SECONDS = 90
 
-# --- Signal Parameters (ALL IN 1-HOUR BARS) ---
-EMA_FAST = 21    # 21-hour EMA
-EMA_SLOW = 55    # 55-hour EMA
-
+# --- Momentum Lookbacks (1h bars) ---
+# r_1h intentionally excluded: noise at 1-bar resolution
 MOMENTUM_LOOKBACKS = {
-    "1h": 1,      # 1 bar  = 1 hour
-    "6h": 6,      # 6 bars = 6 hours
-    "24h": 24,    # 24 bars = 24 hours (1 day)
-    "3d": 72,     # 72 bars = 72 hours (3 days)
-}
-MOMENTUM_WEIGHTS = {
-    "1h": 0.15,
-    "6h": 0.25,
-    "24h": 0.35,
-    "3d": 0.25,
+    "6h": 6,
+    "24h": 24,
+    "3d": 72,
 }
 
-BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "72"))  # 72 bars = 72 hours = 3 days
+BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "72"))
 
-# --- Volatility (1h bars) ---
-VOL_LOOKBACK = 24              # 24 bars = 24 hours for realized vol
-VOL_LONG_LOOKBACK = 168        # 168 bars = 7 days for regime baseline
-ANNUALIZATION_FACTOR = 93.6    # sqrt(24 * 365) = sqrt(8760) for 1h bars
+# --- Volatility ---
+VOL_LOOKBACK = 24
+VOL_LONG_LOOKBACK = 168
+ANNUALIZATION_FACTOR = 93.6  # sqrt(8760) for 1h bars
+
+# --- Regime Detection (HMM on PCs) ---
+# 4 PCs: typically 80-90% of variance in 43-coin crypto universe.
+# 3-state HMM with 4D obs: ~50 params. Stable with 800+ observations.
+# States are NOT pre-labeled. They are analyzed post-fit to derive exposure.
+HMM_N_PCS = 4
+HMM_N_STATES = 3
+HMM_REFIT_INTERVAL_HOURS = 12
+PCA_REFIT_INTERVAL_HOURS = 6
+
+# Forward return horizon for state analysis (how far ahead to look when
+# characterizing each state's profitability).
+STATE_ANALYSIS_FORWARD_HOURS = 24
+
+# --- EWMA Momentum ---
+# Two EWMA horizons averaged. No arbitrary weight allocation.
+# EWMA smooths noise, weights recent hours exponentially, decays older hours.
+# Halflife IS the parameter — grounded in "we care about the last 6-24 hours."
+# Equal average of two horizons = least assumptive choice.
+EWMA_HALFLIFE_SHORT = 6    # 6-hour EWMA — captures short-term shifts
+EWMA_HALFLIFE_LONG = 24    # 24-hour EWMA — captures daily momentum
+
+# Entry gate (simple binary conditions on RAW features, not z-scored):
+#   r_24h > 0: only buy coins with positive 24h momentum
+#   volume_ratio > 0.8: minimum volume confirmation
+# These are deliberately loose — we want active trading.
+# The ranking score handles quality; the gate just eliminates obvious bad entries.
+GATE_MIN_R24H = 0.0
+GATE_MIN_VOLUME_RATIO = 0.8
+
+# Max new entries per cycle — prevents overtrading in a single hour
+MAX_NEW_ENTRIES_PER_CYCLE = 3
 
 # --- Risk Management ---
-# Position sizing: vol-parity should be the binding constraint, not the cap.
-# With TARGET_RISK=0.005 and BTC vol=0.4: size = 0.005*1M / (0.4/19.1) = $238K
-# With DOGE vol=0.8: size = 0.005*1M / (0.8/19.1) = $119K
-# Cap at 15% = $150K only binds for very low vol coins. Vol-parity drives sizing.
 MAX_POSITION_PCT = 0.15
 MAX_TOTAL_EXPOSURE_PCT = 0.80
-TARGET_RISK_PER_TRADE = 0.005    # was 0.025 — too high, cap always bound, vol-parity was off
+TARGET_RISK_PER_TRADE = 0.005
 MAX_POSITIONS = 12
 
-# Trailing stops
-TRAILING_STOP_PCT = 0.03
-MEAN_REV_TAKE_PROFIT = 0.03    # +3% profit target for reversal trades
-MEAN_REV_STOP_LOSS = -0.03     # -3% hard stop for reversal trades
+# Unified trailing stops (no strategy branching)
+HARD_STOP_PCT = 0.035
+PARTIAL_EXIT_PCT = 0.03
+PARTIAL_EXIT_FRACTION = 0.5
+TRAILING_STOP_PCT = 0.035
+TRAILING_STOP_WIDE_PCT = 0.045
+TIME_STOP_HOURS = 60
+TIME_STOP_MIN_GAIN = 0.01
 
-# Drawdown circuit breakers (REDD handles smooth scaling; these are emergency)
+# Drawdown circuit breakers
 DRAWDOWN_LEVEL_1 = 0.035
 DRAWDOWN_LEVEL_2 = 0.06
 DRAWDOWN_LEVEL_3 = 0.10
 DRAWDOWN_PAUSE_HOURS = {1: 0, 2: 4, 3: 12}
+REDD_MAX_DD = 0.10
 
 # --- Execution ---
 USE_LIMIT_ORDERS = True
 LIMIT_ORDER_OFFSET_BPS = 1
 
+# --- ML: Ridge for RANK AVERAGING (not magnitude blending) ---
+# Ridge has significant ranking ability (Spearman +0.020, p=0.025) but
+# noisy magnitudes (R² 1-4%). Score blending hurt (48% → 38% positive).
+# Solution: use Ridge for RANKING only via rank averaging.
+#   1. EWMA ranks coins by momentum
+#   2. Ridge ranks coins by predicted relative return
+#   3. Combined rank = average of two ranks
+#   4. Trade by combined rank, size by EWMA magnitude
+# This preserves Ridge's cross-sectional signal without its magnitude noise.
+ML_ENABLED = False
+ML_LOOKBACK_HOURS = 400
+ML_FORWARD_HORIZON = 24
+ML_SAMPLE_INTERVAL = 24
+ML_RETRAIN_INTERVAL = 6
+ML_BLEND_WEIGHT = 0.3
+ML_MIN_R2 = 0.005
+
+# Feature columns for Lasso (when enabled)
+LASSO_FEATURES = [
+    "r_6h", "r_24h", "r_3d",
+    "persistence", "choppiness",
+    "realized_vol", "downside_vol", "jump_proxy",
+    "breakout_distance", "volume_ratio",
+    "overshoot",
+    "spread_pct",
+]
+
 # --- Coin Filtering ---
+# All 43 coins listed. Dynamic spread filter in ranking.py removes
+# high-spread coins each cycle based on live median spread.
+# This adapts to market conditions: calm → trade broadly, volatile → narrow to liquid.
 TRADEABLE_COINS = [
     "BTC/USD", "ETH/USD", "SOL/USD", "BNB/USD", "XRP/USD",
     "DOGE/USD", "ADA/USD", "AVAX/USD", "LINK/USD", "DOT/USD",
