@@ -255,6 +255,8 @@ The backtest calls the exact same functions as `main.py`. Only the exchange inte
 
 ### 6-Month Out-of-Sample (155 days)
 
+*Note: "Out-of-sample" here means the 6-month backtest includes 2 additional months of data beyond the 4-month period used during strategy development. All parameters (EWMA halflives, stop levels, spread filter logic, exposure floor) were tuned on the 4-month window. The extra 2 months were never seen during development — they test whether the strategy generalizes to unseen market conditions.*
+
 | Metric | Value |
 |---|---|
 | Return | -5.92% |
