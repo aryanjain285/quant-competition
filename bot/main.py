@@ -507,8 +507,8 @@ class TradingBot:
             "regime": self.regime.get_status(),
             "risk": self.risk_mgr.get_status(),
             "drawdown_action": dd_check.get("action", "none"),
-            "ridge_active": self.ranker.using_ridge,
-            "ridge_r2": round(self.ranker.model_r2, 4),
+            "ridge_active": self.ranker.ridge_active,
+            "ridge_r2": round(self.ranker.model_r2, 4) if hasattr(self.ranker, 'model_r2') else 0,
             "metrics": metrics,
         })
 
