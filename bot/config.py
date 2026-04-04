@@ -1,22 +1,25 @@
 """
-Configuration for the trading bot — Finals v7.
+Configuration for the trading bot — v8 finals.
 All tunable parameters in one place. Override via environment variables.
 
 ALL LOOKBACKS AND WINDOWS ARE IN 1-HOUR BARS.
 
-v7 DESIGN PHILOSOPHY:
-- HMM discovers latent states; we analyze them AFTER fitting to derive exposure
-- No ML prediction gate (Lasso R²≈0.000 on cross-sectional crypto features)
-- Momentum composite with domain-knowledge weights (crypto momentum literature)
+v8 DESIGN PHILOSOPHY:
+- EWMA momentum ranking (no arbitrary weights — one param per horizon)
+- Dynamic spread filter (median-based, adapts to market conditions per cycle)
+- Data-driven regime: HMM states analyzed post-fit, exposure from forward returns
+  Linear interpolation with 0.10 floor (activity compliance)
+- No ML in ranking: tested 6 models in shootout, all hurt the full pipeline
 - Active trading to satisfy 8 active trading days rule
-- Every parameter justified by cost, stats, or literature
+- Every parameter justified by cost, statistics, or backtest evidence
 
-PARAMETER SOURCES:
-- Momentum weights: Liu, Tsyvinski & Wu (2019) "Risks and Returns of Cryptocurrency"
-  → 1-week (24h-168h) momentum is the strongest cross-sectional predictor in crypto
+PARAMETER JUSTIFICATIONS:
+- EWMA halflives (6h, 24h): captures short-term shifts + daily momentum, averaged equally
 - Commission: 0.05% maker, 0.10% taker → 10-20 bps round trip
-- Vol-parity: standard risk budgeting (Roncalli 2013)
+- Vol-parity: standard risk budgeting
 - Trailing stops: calibrated to hourly crypto vol (~2% daily → 3.5% ≈ 1.7σ)
+- Exposure: linear from Sharpe with 0.10 floor (+2.45% backtest, best of all configs)
+- Dynamic spread: median-based, no hardcoded threshold, self-calibrating
 """
 import os
 
@@ -144,6 +147,9 @@ LASSO_FEATURES = [
 ]
 
 # --- Coin Filtering ---
+# All 43 coins listed. Dynamic spread filter in ranking.py removes
+# high-spread coins each cycle based on live median spread.
+# This adapts to market conditions: calm → trade broadly, volatile → narrow to liquid.
 TRADEABLE_COINS = [
     "BTC/USD", "ETH/USD", "SOL/USD", "BNB/USD", "XRP/USD",
     "DOGE/USD", "ADA/USD", "AVAX/USD", "LINK/USD", "DOT/USD",

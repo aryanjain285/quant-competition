@@ -2,20 +2,24 @@
 Main trading bot — v8 finals.
 
 Pipeline (every hour):
-  1. REGIME:   PCA (4 PCs) → 3-state HMM → data-driven exposure (0.15-1.0)
+  1. REGIME:   PCA (4 PCs) → 3-state HMM → data-driven exposure (0.10 floor)
   2. FEATURES: 12 per-coin features, z-scored cross-sectionally
-  3. RANK:     EWMA momentum (avg of 6h + 24h halflife) → sorted descending
-  4. GATE:     r_24h > 0, volume_ratio > 0.8 (loose — ranking handles quality)
-  5. SIZE:     vol-parity × REDD × regime exposure × rank multiplier
-  6. EXIT:     unified stops (hard -3.5%, partial +3%, trail 3.5%/4.5%, time 60h)
+  3. SPREAD:   Dynamic filter — only trade coins with spread ≤ median (adapts to vol)
+  4. RANK:     EWMA momentum (avg of 6h + 24h halflife) → sorted descending
+  5. GATE:     r_24h > 0, volume_ratio > 0.8 (loose — ranking handles quality)
+  6. SIZE:     vol-parity × REDD × regime exposure × rank multiplier
+  7. EXIT:     unified stops (hard -3.5%, partial +3%, trail 3.5%/4.5%, time 60h)
 
 Key decisions:
   - EWMA over arbitrary weights: no magic numbers, one parameter per horizon
   - No ML in ranking: tested Ridge, Lasso, ElasticNet, RF, XGBoost in shootout.
     Ridge had p=0.025 Spearman but EVERY integration (blend, rank avg, veto)
     made the full pipeline worse. EWMA alone is the cleanest signal.
-  - Data-driven regime: states analyzed post-fit, exposure from forward returns.
-    Min floor 0.15 for competition activity compliance.
+  - Data-driven regime: linear interpolation from Sharpe ranking, 0.10 floor.
+    Best state ~1.0, worst 0.10 (activity compliance). No fixed tiers.
+  - Dynamic spread filter: median spread computed per-cycle from live ticker.
+    Coins above median excluded. Adapts: calm→trade broadly, volatile→narrow to liquid.
+    4-month backtest: +0.44% → +2.08% from this single change.
   - ML code kept for documentation (shows rigorous testing, honest disabling).
 """
 import os

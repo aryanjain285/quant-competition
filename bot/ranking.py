@@ -1,22 +1,22 @@
 """
-Ranker v7: EWMA ranking + Ridge veto.
+Ranker v8: EWMA ranking with dynamic spread filter.
 
-EWMA drives the ordering (captures momentum — the signal that produces returns).
-Ridge acts as a quality filter: vetoes EWMA picks where the cross-sectional
-model predicts the coin will underperform the universe.
+1. SPREAD FILTER (dynamic, per-cycle):
+   Compute median spread across all coins from LIVE ticker data.
+   Only trade coins with spread <= median.
+   This automatically adapts:
+     Calm markets → tight spreads → trade ~30 coins
+     Volatile markets → wide spreads → narrow to ~15 liquid coins
+   No hardcoded threshold — always the better half of the universe.
 
-Why veto, not reorder or blend:
-  - Score blending (0.70×EWMA + 0.30×Ridge) injected magnitude noise → hurt returns
-  - Rank averaging (avg of two ranks) disrupted momentum ordering → worse
-  - Veto preserves EWMA order and only REMOVES bad picks
-  - The shootout proved Ridge can distinguish good from bad (p=0.025)
-  - A veto uses exactly this: remove the bad, keep the good
+2. EWMA RANKING:
+   Rank surviving coins by avg(EWMA(6h), EWMA(24h)).
+   Highest momentum first. No ML — cleanest signal we found.
 
-Fallback: if Ridge vetoes ALL candidates, trade the top EWMA pick anyway.
-This guarantees the bot always trades (competition activity requirement).
+3. ENTRY GATE:
+   r_24h > 0, volume_ratio > 0.8 (loose, ranking handles quality).
 """
 import numpy as np
-from bot.config import LASSO_FEATURES, ML_MIN_R2
 from bot.features import compute_ewma_momentum, check_entry_gate
 from bot.logger import get_logger
 
@@ -24,19 +24,19 @@ log = get_logger("ranking")
 
 
 class Ranker:
-    """EWMA ranking with Ridge veto on predicted underperformers."""
+    """EWMA ranking with dynamic spread filter."""
 
     def __init__(self):
+        # Ridge kept for potential future use but disabled (ML_ENABLED=False)
         self.model = None
         self.model_r2: float = 0.0
         self.ridge_active: bool = False
+        self.last_median_spread: float = 0.0
+        self.last_filtered_count: int = 0
 
     def set_model(self, model, r2: float):
         self.model = model
         self.model_r2 = r2
-        self.ridge_active = r2 >= ML_MIN_R2
-        status = "ACTIVE (veto mode)" if self.ridge_active else f"OFF (R²={r2:.4f} < {ML_MIN_R2})"
-        log.info(f"Ridge veto {status}")
 
     def has_model(self) -> bool:
         return True
@@ -50,15 +50,6 @@ class Ranker:
     def lasso_r2(self) -> float:
         return self.model_r2
 
-    def _ridge_predict(self, zscored: dict) -> float:
-        """Predict relative return. Only the SIGN matters for veto."""
-        if self.model is None:
-            return 0.0
-        x = [zscored.get(k, 0.0) for k in LASSO_FEATURES]
-        if any(not np.isfinite(v) for v in x):
-            return 0.0
-        return float(self.model.predict([x])[0])
-
     def rank(
         self,
         raw_features: dict[str, dict],
@@ -66,23 +57,51 @@ class Ranker:
         held_pairs: set[str] = None,
         closes_dict: dict[str, np.ndarray] = None,
     ) -> list[tuple[str, float, dict]]:
-        """Rank by EWMA, veto by Ridge.
+        """Rank coins: dynamic spread filter → entry gate → EWMA sort.
 
-        Returns (pair, ewma_score, raw_features) in EWMA order.
-        Ridge only removes — never reorders or adjusts scores.
+        The spread filter adapts each cycle to current market conditions.
+        Coins with spread above the median are excluded — they start
+        every trade in a hole that the profit target can't recover.
         """
         held_pairs = held_pairs or set()
         closes_dict = closes_dict or {}
 
-        # Step 1: EWMA score for all eligible coins
+        # Step 1: Dynamic spread filter
+        # Compute median spread across ALL coins (not just eligible ones)
+        all_spreads = []
+        for pair, raw in raw_features.items():
+            spread = raw.get("spread_pct", 0)
+            if spread > 0:
+                all_spreads.append(spread)
+
+        if all_spreads:
+            median_spread = float(np.median(all_spreads))
+        else:
+            median_spread = 0.001  # fallback ~10 bps
+
+        self.last_median_spread = median_spread
+
+        # Step 2: Filter + gate + EWMA
         eligible = []
+        spread_filtered = 0
+
         for pair in raw_features:
             if pair in held_pairs:
                 continue
+
             raw = raw_features[pair]
+
+            # Dynamic spread filter: only trade coins with spread <= median
+            coin_spread = raw.get("spread_pct", 0)
+            if coin_spread > median_spread and coin_spread > 0:
+                spread_filtered += 1
+                continue
+
+            # Entry gate (r_24h > 0, volume > 0.8)
             if not check_entry_gate(raw):
                 continue
 
+            # EWMA momentum score
             closes = closes_dict.get(pair)
             if closes is not None and len(closes) > 30:
                 ewma = compute_ewma_momentum(closes)
@@ -94,42 +113,17 @@ class Ranker:
 
             eligible.append((pair, ewma, raw))
 
-        # Step 2: Sort by EWMA (highest momentum first)
+        self.last_filtered_count = spread_filtered
+
+        # Sort by EWMA (highest momentum first)
         eligible.sort(key=lambda x: x[1], reverse=True)
 
-        if not eligible:
-            return []
-
-        # Step 3: Ridge veto (if available)
-        if self.ridge_active:
-            survivors = []
-            vetoed = []
-            for pair, ewma, raw in eligible:
-                zs = zscored_features.get(pair, {})
-                ridge_pred = self._ridge_predict(zs)
-
-                if ridge_pred >= 0:
-                    # Ridge agrees or is neutral → keep
-                    survivors.append((pair, ewma, raw))
-                else:
-                    # Ridge predicts underperformance → veto
-                    vetoed.append(pair)
-
-            if survivors:
-                if vetoed:
-                    log.info(f"Ridge vetoed {len(vetoed)}/{len(eligible)} candidates: {vetoed[:3]}")
-                result = survivors
-            else:
-                # Ridge vetoed EVERYTHING → fallback to top EWMA pick
-                log.info(f"Ridge vetoed all {len(eligible)} candidates — falling back to top EWMA")
-                result = [eligible[0]]
-        else:
-            result = eligible
-
-        if result:
+        if eligible:
             log.info(
-                f"Ranked {len(result)} candidates. "
-                f"Top: {result[0][0]} (ewma={result[0][1]:.6f})"
+                f"Ranked {len(eligible)} candidates "
+                f"(spread filter removed {spread_filtered}, "
+                f"median_spread={median_spread*10000:.1f}bps). "
+                f"Top: {eligible[0][0]} (ewma={eligible[0][1]:.6f})"
             )
 
-        return result
+        return eligible
