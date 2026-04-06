@@ -138,6 +138,8 @@ class RiskManager:
         effective_exposure = MAX_TOTAL_EXPOSURE_PCT * self.regime_exposure_mult
         remaining = (effective_exposure * portfolio) - current_exposure_usd
         if remaining <= 0:
+            log.info(f"EXPOSURE CAP: effective={effective_exposure:.2f} × ${portfolio:,.0f} = ${effective_exposure*portfolio:,.0f}, "
+                     f"current=${current_exposure_usd:,.0f}, no room left")
             return 0.0
 
         # Vol-parity base

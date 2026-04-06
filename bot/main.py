@@ -434,8 +434,10 @@ class TradingBot:
 
         for idx, (pair, score, raw_feats) in enumerate(ranked):
             if num_positions >= MAX_POSITIONS:
+                log.info(f"MAX POSITIONS HIT ({MAX_POSITIONS}) — skipping remaining {len(ranked) - idx} candidates")
                 break
             if new_entries >= MAX_NEW_ENTRIES_PER_CYCLE:
+                log.info(f"MAX NEW ENTRIES PER CYCLE HIT ({MAX_NEW_ENTRIES_PER_CYCLE}) — waiting for next hour")
                 break
             if self.positions.get(pair, 0) > 0:
                 continue
