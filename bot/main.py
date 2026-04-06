@@ -135,6 +135,48 @@ class TradingBot:
         self._sync_positions_from_wallet(wallet)
         self.cycle_count = 0
 
+        # Restore trailing stops from saved state (survives redeployment)
+        self._load_saved_state()
+
+    def _load_saved_state(self):
+        """Restore trailing stops from save_state.py output.
+
+        This preserves entry prices across redeployments so stops
+        don't reset to current price. The file is deleted after loading.
+        """
+        import json
+        state_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bot", "state.json")
+        if not os.path.exists(state_path):
+            return
+
+        try:
+            with open(state_path) as f:
+                state = json.load(f)
+
+            stops = state.get("trailing_stops", {})
+            restored = 0
+            for pair, info in stops.items():
+                if pair in self.positions and self.positions[pair] > 0:
+                    self.risk_mgr.update_trailing_stop(
+                        pair, info["high"],
+                        entry_price=info["entry_price"],
+                    )
+                    # Set the high watermark
+                    if pair in self.risk_mgr.trailing_stops:
+                        self.risk_mgr.trailing_stops[pair]["high"] = info["high"]
+                        self.risk_mgr.trailing_stops[pair]["entry_time"] = info.get("entry_time", time.time())
+                        self.risk_mgr.trailing_stops[pair]["partial_taken"] = info.get("partial_taken", False)
+                    restored += 1
+
+            log.info(f"Restored {restored} trailing stops from saved state")
+
+            # Delete the file so it doesn't load again on next restart
+            os.remove(state_path)
+            log.info(f"Deleted {state_path}")
+
+        except Exception as e:
+            log.warning(f"Failed to load saved state: {e}")
+
     # ─── Helpers ────────────────────────────────────────────────
 
     def _sync_positions_from_wallet(self, wallet: dict):
@@ -417,8 +459,11 @@ class TradingBot:
             else:
                 rank_mult = 1.0
 
-            # Signal strength from score (clamp to reasonable range)
-            signal_strength = min(1.3, max(0.3, 0.5 + score * 0.5))
+            # Signal strength: EWMA scores are ~0.001, so the old formula
+            # (0.5 + score*0.5) always produced ~0.5, halving every position.
+            # The RANK already determines capital allocation via rank_mult.
+            # Signal strength is set to 1.0 — sizing controlled by vol-parity + regime.
+            signal_strength = 1.0
 
             size_usd = self.risk_mgr.position_size_usd(
                 pair, real_vol, total_exposure, num_positions,
