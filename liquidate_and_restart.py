@@ -19,6 +19,17 @@ from bot.roostoo_client import RoostooClient
 
 client = RoostooClient()
 
+# Get exchange info for quantity precision
+info = client.exchange_info()
+trade_pairs = info.get("TradePairs", {}) if info else {}
+
+def round_qty(pair, qty):
+    """Round quantity to pair's amount precision."""
+    prec = trade_pairs.get(pair, {}).get("AmountPrecision", 2)
+    if prec == 0:
+        return int(qty)
+    return round(qty, prec)
+
 # 1. Verify connection
 st = client.server_time()
 if st is None:
@@ -72,40 +83,64 @@ print(f"\nCancelling all pending orders...")
 result = client.cancel_order()
 print(f"  Cancel result: {result}")
 
-# Wait a moment for locks to clear
-time.sleep(2)
+# Wait for locks to clear after cancellation
+print("Waiting 3s for pending order locks to clear...")
+time.sleep(3)
 
 # Re-fetch wallet after cancellation
 wallet = client.balance()
+if wallet is None:
+    print("ERROR: Cannot re-fetch balance after cancel")
+    sys.exit(1)
+
+# Refresh ticker for current prices
+ticker = client.ticker()
 
 # 6. Liquidate all positions at market
-print(f"\nLiquidating {len(positions)} positions...")
-for pair in positions:
+print(f"\nLiquidating positions...")
+sold = 0
+failed = 0
+
+for pair in list(positions.keys()):
     coin = pair.split("/")[0]
     bal = wallet.get(coin, {})
     free = bal.get("Free", 0)
 
     if free <= 0:
-        print(f"  {pair}: no free balance to sell (may be locked)")
+        print(f"  {pair}: no free balance to sell (still locked?)")
+        failed += 1
+        continue
+
+    # Round to exchange precision
+    qty = round_qty(pair, free)
+    if qty <= 0:
+        print(f"  {pair}: qty rounds to 0 (balance too small)")
         continue
 
     price = ticker.get(pair, {}).get("LastPrice", 0) if ticker else 0
-    value = free * price
+    value = qty * price
 
-    print(f"  Selling {pair}: qty={free:.6f} @ ~${price:.2f} ≈ ${value:,.2f}")
+    print(f"  Selling {pair}: qty={qty} @ ~${price:.4f} ≈ ${value:,.2f}")
     result = client.place_order(
         pair=pair,
         side="SELL",
-        quantity=free,
+        quantity=qty,
         order_type="MARKET",
     )
     if result and result.get("Success"):
         detail = result.get("OrderDetail", {})
-        print(f"    SOLD: qty={detail.get('FilledQuantity', 0):.6f} @ ${detail.get('FilledAverPrice', 0):.2f}")
+        filled = detail.get("FilledQuantity", 0)
+        fill_price = detail.get("FilledAverPrice", 0)
+        print(f"    SOLD: qty={filled} @ ${fill_price:.4f}")
+        sold += 1
     else:
-        print(f"    FAILED: {result}")
+        err = result.get("ErrMsg", "unknown") if result else "no response"
+        print(f"    FAILED: {err}")
+        failed += 1
 
-    time.sleep(0.5)  # avoid rate limiting
+    time.sleep(0.3)
+
+print(f"\nSold: {sold}, Failed: {failed}")
 
 # 7. Verify clean state
 time.sleep(2)
