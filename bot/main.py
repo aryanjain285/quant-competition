@@ -461,11 +461,12 @@ class TradingBot:
             else:
                 rank_mult = 1.0
 
-            # Signal strength: EWMA scores are ~0.001, so the old formula
-            # (0.5 + score*0.5) always produced ~0.5, halving every position.
-            # The RANK already determines capital allocation via rank_mult.
-            # Signal strength is set to 1.0 — sizing controlled by vol-parity + regime.
-            signal_strength = 1.0
+            # Signal strength fixed at 0.5. Backtest ablation showed that
+            # commit 8d506e6's change to 1.0 cost 2.6pp of return over 4 months
+            # and flipped the strategy from positive to negative expectation
+            # (+0.55% → -2.01%). Reverting that single line, keeping everything
+            # else from 8d506e6 (state restore, logging) intact.
+            signal_strength = 0.5
 
             size_usd = self.risk_mgr.position_size_usd(
                 pair, real_vol, total_exposure, num_positions,
