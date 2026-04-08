@@ -1,24 +1,24 @@
 """
-Backtest engine v6: mirrors main.py's run_cycle() exactly.
+Backtest engine that mirrors the live hourly cycle as closely as bars allow.
 
-Design: import and call the SAME modules as live trading:
-  - features.compute_coin_features (same features)
-  - features.zscore_universe (same z-scoring)
-  - features.check_breakdown (same exit signal)
-  - ranking.Ranker with Lasso (same ranking + gate)
-  - regime_detector.RegimeDetector (same PCA-HMM regime)
-  - risk_manager.RiskManager (same unified stops, REDD, sizing)
-  - ml.RidgeTrainer (same training pipeline)
+Design: import and call the same strategy modules as live trading:
+  - features.compute_coin_features
+  - features.zscore_universe
+  - features.check_breakdown
+  - ranking.Ranker
+  - regime_detector.RegimeDetector
+  - risk_manager.RiskManager
+  - executor.Executor
 
-The ONLY difference is SimExchange instead of RoostooClient.
+The simulation differs from live only at the exchange boundary.
 
-Pipeline (matches main.py exactly):
-  1. Regime: PCA → 3 PCs → HMM → trade or sit out
-  2. Features: compute per-coin, z-score cross-sectionally
-  3. Rank: Lasso predicted 24h return for all coins
-  4. Gate: predicted return > ENTRY_THRESHOLD
-  5. Size: vol-parity × REDD × regime × strength × rank_mult
-  6. Exit: unified trailing stops + breakdown detection
+Execution notes:
+  1. Fetch the same per-cycle data the live bot uses.
+  2. Update regime state and exposure multiplier.
+  3. Process pending orders through Executor.manage_pending_orders().
+  4. Build features, rank candidates, and run the same exit checks.
+  5. Size entries from the shared FIXED_SIGNAL_STRENGTH input.
+  6. Simulate fills with next-bar eligibility for new limit orders.
 """
 import time as _time_module
 import numpy as np
@@ -27,10 +27,10 @@ from dataclasses import dataclass, field
 
 from bot.backtest.sim_exchange import SimExchange, SimClock
 from bot.config import (
-    BREAKOUT_LOOKBACK, MAX_POSITIONS, MAX_TOTAL_EXPOSURE_PCT,
-    USE_LIMIT_ORDERS, LIMIT_ORDER_TIMEOUT_SECONDS, TRADEABLE_COINS,
-    LASSO_FEATURES, MAX_NEW_ENTRIES_PER_CYCLE,
+    BREAKOUT_LOOKBACK, MAX_POSITIONS,
+    USE_LIMIT_ORDERS, TRADEABLE_COINS, MAX_NEW_ENTRIES_PER_CYCLE,
     ML_ENABLED, ML_RETRAIN_INTERVAL, HMM_REFIT_INTERVAL_HOURS,
+    FIXED_SIGNAL_STRENGTH,
 )
 from bot.features import compute_coin_features, zscore_universe, check_breakdown
 from bot.ranking import Ranker
@@ -55,7 +55,7 @@ class BacktestResult:
 
 
 class BacktestEngine:
-    """Runs the exact v6 pipeline against simulated exchange data."""
+    """Runs the current live pipeline against simulated exchange data."""
 
     def __init__(
         self,
@@ -85,7 +85,7 @@ class BacktestEngine:
         return np.column_stack([s[-min_len:] for s in series])
 
     def _build_historical_data(self, t: int) -> dict[str, list[dict]]:
-        """Build dict-of-bars for RidgeTrainer up to bar t."""
+        """Build dict-of-bars for optional ML retraining up to bar t."""
         data = {}
         for pair in self.active_pairs:
             candles = self.all_candles[pair][:t + 1]
@@ -99,7 +99,7 @@ class BacktestEngine:
         end: int,
         initial_cash: float = INITIAL_CASH,
     ) -> BacktestResult:
-        """Run backtest from bar `start` to `end`, mirroring main.py exactly."""
+        """Run backtest from bar `start` to `end`, mirroring the live cycle."""
 
         clock = SimClock()
         original_time = _time_module.time
@@ -129,7 +129,7 @@ class BacktestEngine:
                 if pc_scores is not None and len(pc_scores) > 100:
                     regime.fit_hmm(pc_scores)
 
-            # Initial Lasso training (optional boost)
+            # Initial ML training (currently disabled by default)
             if ML_ENABLED:
                 try:
                     hist = self._build_historical_data(start)
@@ -157,7 +157,7 @@ class BacktestEngine:
                 perf.record(pv)
                 result.portfolio_history.append(pv)
 
-                # ── Optional Lasso retrain ──
+                # ── Optional ML retrain ──
                 if ML_ENABLED and cycle_count % ML_RETRAIN_INTERVAL == 1:
                     try:
                         hist = self._build_historical_data(t)
@@ -196,12 +196,8 @@ class BacktestEngine:
                 regime.update(pc_scores=pc_scores)
                 risk_mgr.set_regime_multiplier(regime.get_exposure_multiplier())
 
-                # ── Process pending fills ──
-                fill_events = exchange.advance_pending_orders()
-                for oid in list(executor.pending_orders.keys()):
-                    if oid not in exchange.pending_orders:
-                        executor.pending_orders.pop(oid, None)
-
+                # ── Process pending orders via the same executor path as live ──
+                fill_events = executor.manage_pending_orders()
                 for fill in fill_events:
                     pair = fill["pair"]
                     fqty = fill["filled_qty"]
@@ -211,16 +207,6 @@ class BacktestEngine:
                                                        entry_price=fill["filled_avg_price"])
                     elif fill["side"] == "SELL" and fqty > 0:
                         positions[pair] = max(0, positions.get(pair, 0) - fqty)
-
-                # Stale order cancellation
-                now = clock.time()
-                for oid in list(executor.pending_orders.keys()):
-                    info = executor.pending_orders.get(oid)
-                    if info and now - info["time_placed"] > LIMIT_ORDER_TIMEOUT_SECONDS:
-                        exchange.cancel_order(oid)
-                        executor.pending_orders.pop(oid, None)
-                        if info["side"] == "SELL":
-                            exchange.place_order(info["pair"], "SELL", info["quantity"], "MARKET")
 
                 regime_name = regime.get_status().get("regime", "UNKNOWN")
 
@@ -315,7 +301,7 @@ class BacktestEngine:
                     else:
                         rank_mult = 1.0
 
-                    signal_strength = min(1.3, max(0.3, 0.5 + score * 0.5))
+                    signal_strength = FIXED_SIGNAL_STRENGTH
 
                     size_usd = risk_mgr.position_size_usd(
                         pair, real_vol, total_exposure, num_pos,
@@ -340,7 +326,7 @@ class BacktestEngine:
                                 entry_price=detail.get("FilledAverPrice", price),
                             )
                             total_exposure += size_usd
-                            num_pos += 1
+                            num_pos = sum(1 for q in positions.values() if q > 0)
                             new_entries += 1
                             result.trade_log.append({
                                 "bar": t, "pair": pair, "reason": "buy",
@@ -365,7 +351,7 @@ class BacktestEngine:
             _time_module.time = original_time
 
     def _check_exits(self, positions, ticker_data, risk_mgr, executor, result, bar):
-        """Unified trailing stops — matches main.py _check_exits exactly."""
+        """Unified trailing stops matching the live bot's exit logic."""
         for pair, qty in list(positions.items()):
             if qty <= 0:
                 continue

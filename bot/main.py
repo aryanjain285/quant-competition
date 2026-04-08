@@ -1,5 +1,5 @@
 """
-Main trading bot — v8 finals.
+Main trading bot.
 
 Pipeline (every hour):
   1. REGIME:   PCA (4 PCs) → 3-state HMM → data-driven exposure (0.10 floor)
@@ -36,7 +36,7 @@ from bot.config import (
     MAX_TOTAL_EXPOSURE_PCT, USE_LIMIT_ORDERS, BREAKOUT_LOOKBACK,
     MAX_POSITIONS, MAX_NEW_ENTRIES_PER_CYCLE,
     ML_ENABLED, ML_RETRAIN_INTERVAL,
-    HMM_REFIT_INTERVAL_HOURS,
+    HMM_REFIT_INTERVAL_HOURS, FIXED_SIGNAL_STRENGTH,
 )
 from bot.roostoo_client import RoostooClient
 from bot.binance_data import BinanceData
@@ -80,11 +80,11 @@ def _sleep_until(ts: float):
 
 
 class TradingBot:
-    """Main trading bot orchestrator — v7 momentum-driven pipeline."""
+    """Main trading bot orchestrator for the current momentum pipeline."""
 
     def __init__(self):
         log.info("=" * 60)
-        log.info("INITIALIZING TRADING BOT v7 (momentum + data-driven regime)")
+        log.info("INITIALIZING TRADING BOT (momentum + data-driven regime)")
         log.info("=" * 60)
 
         # ── Core infrastructure ──
@@ -268,12 +268,12 @@ class TradingBot:
             if pc_scores is not None and len(pc_scores) > 100:
                 self.regime.fit_hmm(pc_scores)
 
-        # Initial Lasso training (optional boost)
+        # Initial ML training (currently disabled by default)
         if ML_ENABLED:
             try:
                 self._refresh_ridge()
             except Exception as e:
-                log.error(f"Initial Lasso training failed: {e}")
+                log.error(f"Initial ML training failed: {e}")
 
         log.info("Historical data loaded. Bot ready.")
 
@@ -301,12 +301,12 @@ class TradingBot:
         self.risk_mgr.update_portfolio_value(portfolio_value)
         self.perf.record(portfolio_value)
 
-        # Optional Lasso retrain
+        # Optional ML retrain
         if ML_ENABLED and self.cycle_count % ML_RETRAIN_INTERVAL == 1:
             try:
                 self._refresh_ridge()
             except Exception as e:
-                log.error(f"Lasso training failed: {e}")
+                log.error(f"ML training failed: {e}")
 
         # Drawdown breakers
         dd_check = self.risk_mgr.check_drawdown_breakers()
@@ -461,12 +461,7 @@ class TradingBot:
             else:
                 rank_mult = 1.0
 
-            # Signal strength fixed at 0.5. Backtest ablation showed that
-            # commit 8d506e6's change to 1.0 cost 2.6pp of return over 4 months
-            # and flipped the strategy from positive to negative expectation
-            # (+0.55% → -2.01%). Reverting that single line, keeping everything
-            # else from 8d506e6 (state restore, logging) intact.
-            signal_strength = 0.5
+            signal_strength = FIXED_SIGNAL_STRENGTH
 
             size_usd = self.risk_mgr.position_size_usd(
                 pair, real_vol, total_exposure, num_positions,
@@ -579,10 +574,10 @@ class TradingBot:
         global _running
 
         log.info("=" * 60)
-        log.info("TRADING BOT v7 — FINALS")
+        log.info("TRADING BOT")
         log.info("Pipeline: regime(HMM) → features → momentum rank → gate → size → exit")
         log.info(f"Regime: HMM on {self.regime.n_pcs} PCs, states analyzed post-fit")
-        log.info(f"Signal: momentum composite (optional Lasso boost)")
+        log.info("Signal: momentum composite")
         log.info(f"Active pairs: {len(self.active_pairs)}")
         log.info(f"ML enabled: {ML_ENABLED}")
         log.info("=" * 60)

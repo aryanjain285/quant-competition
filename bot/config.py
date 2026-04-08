@@ -1,10 +1,10 @@
 """
-Configuration for the trading bot — v8 finals.
+Configuration for the trading bot.
 All tunable parameters in one place. Override via environment variables.
 
 ALL LOOKBACKS AND WINDOWS ARE IN 1-HOUR BARS.
 
-v8 DESIGN PHILOSOPHY:
+DESIGN PHILOSOPHY:
 - EWMA momentum ranking (no arbitrary weights — one param per horizon)
 - Dynamic spread filter (median-based, adapts to market conditions per cycle)
 - Data-driven regime: HMM states analyzed post-fit, exposure from forward returns
@@ -18,7 +18,7 @@ PARAMETER JUSTIFICATIONS:
 - Commission: 0.05% maker, 0.10% taker → 10-20 bps round trip
 - Vol-parity: standard risk budgeting
 - Trailing stops: calibrated to hourly crypto vol (~2% daily → 3.5% ≈ 1.7σ)
-- Exposure: linear from Sharpe with 0.10 floor (+2.45% backtest, best of all configs)
+- Exposure: linear from Sharpe with 0.10 floor
 - Dynamic spread: median-based, no hardcoded threshold, self-calibrating
 """
 import os
@@ -92,6 +92,10 @@ GATE_MIN_VOLUME_RATIO = 0.8
 
 # Max new entries per cycle — prevents overtrading in a single hour
 MAX_NEW_ENTRIES_PER_CYCLE = 3
+
+# Entry sizing strength. This is intentionally shared by live + backtest
+# so position sizing cannot drift between the two paths.
+FIXED_SIGNAL_STRENGTH = float(os.getenv("FIXED_SIGNAL_STRENGTH", "0.5"))
 
 # --- Risk Management ---
 MAX_POSITION_PCT = 0.15

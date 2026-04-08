@@ -10,8 +10,8 @@ Key fidelity features:
   - Per-pair spreads calibrated from real Roostoo API measurements
   - Real exchange_info (precision, min order) fetched once and cached
   - Correct fee model: limit = 0.05% maker, market = 0.10% taker
-  - Limit order fills: pending → fill next bar if price within H/L
-  - Stale limit orders cancelled after timeout, sells resubmitted as market
+  - Limit order fills: pending -> eligible from the next bar if price is touched
+  - Pending orders are managed through the same Executor timeout path as live
   - Simulated clock that risk_manager.check_trailing_stop uses for holding hours
 """
 import time as _real_time
@@ -219,12 +219,8 @@ class SimExchange:
         # Limit order
         limit_price = float(price) if price is not None else tick["LastPrice"]
 
-        # Check if limit would fill immediately within this bar's range
-        if self._bar_contains_price(pair, limit_price):
-            # Limit fills as MAKER (0.05% fee) — this is the correct Roostoo behavior
-            return self._fill(pair, side, quantity, limit_price, is_maker=True)
-
-        # Not fillable this bar — goes to pending
+        # Live orders are placed after the decision for the current hour has already
+        # been made. With 1h bars, the earliest fill we can justify is the NEXT bar.
         oid = self._next_oid()
         self.pending_orders[oid] = {
             "pair": pair,
@@ -232,6 +228,7 @@ class SimExchange:
             "quantity": quantity,
             "price": limit_price,
             "placed_time": self.clock.time(),
+            "eligible_bar": self._current_bar + 1,
         }
         return {
             "Success": True,
@@ -248,7 +245,8 @@ class SimExchange:
         fill_events = []
         for oid in list(self.pending_orders.keys()):
             info = self.pending_orders[oid]
-            if self._bar_contains_price(info["pair"], info["price"]):
+            eligible_bar = info.get("eligible_bar", 0)
+            if self._current_bar >= eligible_bar and self._bar_contains_price(info["pair"], info["price"]):
                 result = self._fill(
                     info["pair"], info["side"], info["quantity"],
                     info["price"], is_maker=True,
@@ -275,6 +273,23 @@ class SimExchange:
         """Simulate query_order for pending order checks."""
         if order_id is not None and order_id in self.pending_orders:
             info = self.pending_orders[order_id]
+            eligible_bar = info.get("eligible_bar", 0)
+            if self._current_bar >= eligible_bar and self._bar_contains_price(info["pair"], info["price"]):
+                result = self._fill(
+                    info["pair"], info["side"], info["quantity"],
+                    info["price"], is_maker=True,
+                )
+                self.pending_orders.pop(order_id, None)
+                if result.get("Success"):
+                    detail = result["OrderDetail"]
+                    return [{
+                        "OrderID": detail.get("OrderID", order_id),
+                        "Status": "FILLED",
+                        "FilledQuantity": detail.get("FilledQuantity", 0),
+                        "FilledAverPrice": detail.get("FilledAverPrice", 0),
+                        "Pair": info["pair"],
+                        "Side": info["side"],
+                    }]
             return [{"OrderID": order_id, "Status": "PENDING",
                      "FilledQuantity": 0, "FilledAverPrice": 0,
                      "Pair": info["pair"], "Side": info["side"]}]
