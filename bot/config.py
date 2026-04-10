@@ -47,8 +47,8 @@ POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL", "3600"))
 LIMIT_ORDER_TIMEOUT_SECONDS = 90
 
 # --- Momentum Lookbacks (1h bars) ---
-# r_1h intentionally excluded: noise at 1-bar resolution
 MOMENTUM_LOOKBACKS = {
+    "1h": 1,
     "6h": 6,
     "24h": 24,
     "3d": 72,
@@ -75,19 +75,19 @@ PCA_REFIT_INTERVAL_HOURS = 6
 STATE_ANALYSIS_FORWARD_HOURS = 24
 
 # --- EWMA Momentum ---
-# Two EWMA horizons averaged. No arbitrary weight allocation.
+# Two EWMA horizons combined into a short-horizon-heavy blend.
 # EWMA smooths noise, weights recent hours exponentially, decays older hours.
 # Halflife IS the parameter — grounded in "we care about the last 6-24 hours."
-# Equal average of two horizons = least assumptive choice.
 EWMA_HALFLIFE_SHORT = 6    # 6-hour EWMA — captures short-term shifts
 EWMA_HALFLIFE_LONG = 24    # 24-hour EWMA — captures daily momentum
+EWMA_WEIGHT_SHORT = 0.8
+EWMA_WEIGHT_LONG = 0.2
 
 # Entry gate (simple binary conditions on RAW features, not z-scored):
-#   r_24h > 0: only buy coins with positive 24h momentum
+#   r_1h > 1%: require a strong first impulse bar
 #   volume_ratio > 0.8: minimum volume confirmation
-# These are deliberately loose — we want active trading.
-# The ranking score handles quality; the gate just eliminates obvious bad entries.
-GATE_MIN_R24H = 0.0
+# The ranking score then tries to capture follow-through over the next bars.
+GATE_MIN_R1H = 0.01
 GATE_MIN_VOLUME_RATIO = 0.8
 
 # Max new entries per cycle — prevents overtrading in a single hour
@@ -95,7 +95,7 @@ MAX_NEW_ENTRIES_PER_CYCLE = 3
 
 # Entry sizing strength. This is intentionally shared by live + backtest
 # so position sizing cannot drift between the two paths.
-FIXED_SIGNAL_STRENGTH = float(os.getenv("FIXED_SIGNAL_STRENGTH", "0.5"))
+FIXED_SIGNAL_STRENGTH = float(os.getenv("FIXED_SIGNAL_STRENGTH", "1.0"))
 
 # --- Risk Management ---
 MAX_POSITION_PCT = 0.15

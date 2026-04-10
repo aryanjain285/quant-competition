@@ -234,15 +234,19 @@ def zscore_universe(
 def compute_ewma_momentum(closes: np.ndarray) -> float:
     """Compute EWMA momentum score from close prices.
 
-    score = average of EWMA(log_returns, halflife=6h) and EWMA(log_returns, halflife=24h)
+    score = 0.8 * EWMA(log_returns, halflife=6h) + 0.2 * EWMA(log_returns, halflife=24h)
 
     EWMA naturally weights recent returns more. Halflife=24 means returns
     from 24 hours ago have half the weight of the current hour.
-    No arbitrary weight allocation — just average two horizons.
 
-    Returns the averaged EWMA value (a smoothed recent log return rate).
+    Returns the blended EWMA value (a smoothed recent log return rate).
     """
-    from bot.config import EWMA_HALFLIFE_SHORT, EWMA_HALFLIFE_LONG
+    from bot.config import (
+        EWMA_HALFLIFE_SHORT,
+        EWMA_HALFLIFE_LONG,
+        EWMA_WEIGHT_SHORT,
+        EWMA_WEIGHT_LONG,
+    )
 
     if len(closes) < EWMA_HALFLIFE_LONG + 5:
         return 0.0
@@ -262,21 +266,21 @@ def compute_ewma_momentum(closes: np.ndarray) -> float:
     ewma_short = _ewma_last(log_rets, EWMA_HALFLIFE_SHORT)
     ewma_long = _ewma_last(log_rets, EWMA_HALFLIFE_LONG)
 
-    return (ewma_short + ewma_long) / 2.0
+    return (EWMA_WEIGHT_SHORT * ewma_short) + (EWMA_WEIGHT_LONG * ewma_long)
 
 
 def check_entry_gate(raw_features: dict) -> bool:
     """Simple binary gate on RAW (not z-scored) features.
 
     Conditions:
-    1. r_24h > 0: positive 24h momentum (don't buy declining coins)
+    1. r_1h > 1%: require an initial impulse bar
     2. volume_ratio > 0.8: minimum volume activity
 
-    These are deliberately loose. The EWMA ranking handles quality;
-    the gate just eliminates obviously wrong entries.
+    The short-horizon-heavy EWMA ranking then tries to capture the
+    follow-through over the next bars.
     """
-    from bot.config import GATE_MIN_R24H, GATE_MIN_VOLUME_RATIO
-    if raw_features.get("r_24h", 0) <= GATE_MIN_R24H:
+    from bot.config import GATE_MIN_R1H, GATE_MIN_VOLUME_RATIO
+    if raw_features.get("r_1h", 0) <= GATE_MIN_R1H:
         return False
     if raw_features.get("volume_ratio", 0) < GATE_MIN_VOLUME_RATIO:
         return False

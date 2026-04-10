@@ -10,11 +10,11 @@ Ranker v8: EWMA ranking with dynamic spread filter.
    No hardcoded threshold — always the better half of the universe.
 
 2. EWMA RANKING:
-   Rank surviving coins by avg(EWMA(6h), EWMA(24h)).
+   Rank surviving coins by 0.8 * EWMA(6h) + 0.2 * EWMA(24h).
    Highest momentum first. No ML — cleanest signal we found.
 
 3. ENTRY GATE:
-   r_24h > 0, volume_ratio > 0.8 (loose, ranking handles quality).
+   r_1h > 1%, volume_ratio > 0.8.
 """
 import numpy as np
 from bot.features import compute_ewma_momentum, check_entry_gate
@@ -97,7 +97,7 @@ class Ranker:
                 spread_filtered += 1
                 continue
 
-            # Entry gate (r_24h > 0, volume > 0.8)
+            # Entry gate (r_1h > 1%, volume > 0.8)
             if not check_entry_gate(raw):
                 continue
 

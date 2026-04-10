@@ -5,13 +5,13 @@ Pipeline (every hour):
   1. REGIME:   PCA (4 PCs) → 3-state HMM → data-driven exposure (0.10 floor)
   2. FEATURES: 12 per-coin features, z-scored cross-sectionally
   3. SPREAD:   Dynamic filter — only trade coins with spread ≤ median (adapts to vol)
-  4. RANK:     EWMA momentum (avg of 6h + 24h halflife) → sorted descending
-  5. GATE:     r_24h > 0, volume_ratio > 0.8 (loose — ranking handles quality)
+  4. RANK:     EWMA momentum (0.8 * 6h + 0.2 * 24h halflife) → sorted descending
+  5. GATE:     r_1h > 1%, volume_ratio > 0.8
   6. SIZE:     vol-parity × REDD × regime exposure × rank multiplier
   7. EXIT:     unified stops (hard -3.5%, partial +3%, trail 3.5%/4.5%, time 60h)
 
 Key decisions:
-  - EWMA over arbitrary weights: no magic numbers, one parameter per horizon
+  - EWMA front-weights the short horizon to react faster after an impulse bar
   - No ML in ranking: tested Ridge, Lasso, ElasticNet, RF, XGBoost in shootout.
     Ridge had p=0.025 Spearman but EVERY integration (blend, rank avg, veto)
     made the full pipeline worse. EWMA alone is the cleanest signal.
@@ -578,6 +578,7 @@ class TradingBot:
         log.info("Pipeline: regime(HMM) → features → momentum rank → gate → size → exit")
         log.info(f"Regime: HMM on {self.regime.n_pcs} PCs, states analyzed post-fit")
         log.info("Signal: momentum composite")
+        log.info(f"Fixed signal strength: {FIXED_SIGNAL_STRENGTH:.2f}")
         log.info(f"Active pairs: {len(self.active_pairs)}")
         log.info(f"ML enabled: {ML_ENABLED}")
         log.info("=" * 60)
